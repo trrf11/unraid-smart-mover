@@ -82,6 +82,40 @@ error_log() {
     log_message "ERROR: $1"
 }
 
+# Function to validate API key format
+# Jellyfin API keys are 32-character hexadecimal strings
+validate_api_key_format() {
+    local api_key="$1"
+
+    # Check if empty
+    if [ -z "$api_key" ]; then
+        log_message "ERROR: JELLYFIN_API_KEY is empty"
+        log_message "ERROR: Please set your Jellyfin API key in the script configuration"
+        log_message "ERROR: You can generate an API key in Jellyfin: Dashboard > API Keys > Add"
+        return 1
+    fi
+
+    # Check length (should be 32 characters)
+    local key_length=${#api_key}
+    if [ "$key_length" -ne 32 ]; then
+        log_message "ERROR: Invalid API key format - expected 32 characters, got $key_length"
+        log_message "ERROR: Jellyfin API keys should be exactly 32 hexadecimal characters"
+        log_message "ERROR: Example format: 0123456789abcdef0123456789abcdef"
+        return 1
+    fi
+
+    # Check if it's a valid hexadecimal string (only 0-9, a-f, A-F)
+    if ! [[ "$api_key" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        log_message "ERROR: Invalid API key format - must contain only hexadecimal characters (0-9, a-f)"
+        log_message "ERROR: Your API key contains invalid characters"
+        log_message "ERROR: Please verify your API key in Jellyfin: Dashboard > API Keys"
+        return 1
+    fi
+
+    log_message "DEBUG: API key format validated successfully"
+    return 0
+}
+
 # Function to test API endpoints
 test_api_endpoints() {
     log_message "DEBUG: Testing API connection..."
@@ -395,28 +429,28 @@ process_played_items() {
 validate_environment() {
     set -e  # Exit on error
     trap 'log_message "ERROR: An error occurred in validate_environment at line $LINENO"' ERR
-    
+
     log_message "DEBUG: Validating environment..."
-    
+
     # Check required environment variables
     if [ -z "$JELLYFIN_URL" ]; then
         log_message "ERROR: JELLYFIN_URL is not set"
         return 1
     fi
     log_message "DEBUG: JELLYFIN_URL is set to: $JELLYFIN_URL"
-    
-    if [ -z "$JELLYFIN_API_KEY" ]; then
-        log_message "ERROR: JELLYFIN_API_KEY is not set"
+
+    # Validate API key format before attempting any API calls
+    if ! validate_api_key_format "$JELLYFIN_API_KEY"; then
         return 1
     fi
-    log_message "DEBUG: JELLYFIN_API_KEY is set (value hidden)"
-    
+    log_message "DEBUG: JELLYFIN_API_KEY format is valid (value hidden)"
+
     if [ -z "$JELLYFIN_USER_ID" ]; then
         log_message "ERROR: JELLYFIN_USER_ID is not set"
         return 1
     fi
     log_message "DEBUG: JELLYFIN_USER_ID is set to: $JELLYFIN_USER_ID"
-    
+
     # Test Jellyfin connection
     log_message "DEBUG: Testing Jellyfin connection..."
     local test_response
