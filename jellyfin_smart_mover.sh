@@ -52,6 +52,32 @@ ARRAY_PATH="/mnt/disk1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="$SCRIPT_DIR/jellyfin_smart_mover.log"
 
+# Dry-run mode flag
+DRY_RUN=false
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dry-run|-n)
+            DRY_RUN=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --dry-run, -n    Run without making any filesystem changes"
+            echo "  --help, -h       Show this help message"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--dry-run|-n] [--help|-h]"
+            exit 1
+            ;;
+    esac
+done
+
 # Function to log messages to both console and file
 log_message() {
     local timestamp
@@ -80,6 +106,13 @@ debug_log() {
 # Function to log error messages
 error_log() {
     log_message "ERROR: $1"
+}
+
+# Function to log dry-run actions
+dry_run_log() {
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] $1"
+    fi
 }
 
 # Function to validate API key format
@@ -357,22 +390,36 @@ process_item() {
     fi
     
     log_message "DEBUG: Moving $item_path to $array_path"
-    
+
     # Create target directory if it doesn't exist
     local target_dir
     target_dir=$(dirname "$array_path")
-    if ! mkdir -p "$target_dir"; then
-        log_message "ERROR: Failed to create target directory: $target_dir"
-        return 1
+
+    if [ "$DRY_RUN" = true ]; then
+        if [ ! -d "$target_dir" ]; then
+            dry_run_log "Would create directory: $target_dir"
+        fi
+    else
+        if ! mkdir -p "$target_dir"; then
+            log_message "ERROR: Failed to create target directory: $target_dir"
+            return 1
+        fi
     fi
-    
+
     # Move file
-    if mv "$item_path" "$array_path"; then
-        log_message "Successfully moved: $item_path to array"
+    if [ "$DRY_RUN" = true ]; then
+        local file_size
+        file_size=$(du -h "$item_path" 2>/dev/null | cut -f1)
+        dry_run_log "Would move: $item_path ($file_size) -> $array_path"
         return 0
     else
-        log_message "ERROR: Failed to move $item_path to $array_path"
-        return 1
+        if mv "$item_path" "$array_path"; then
+            log_message "Successfully moved: $item_path to array"
+            return 0
+        else
+            log_message "ERROR: Failed to move $item_path to $array_path"
+            return 1
+        fi
     fi
 }
 
@@ -420,8 +467,12 @@ process_played_items() {
             errors=$((errors + 1))
         fi
     done < "$tmp_items"
-    
-    log_message "Summary: Processed $count items, moved $moved files, encountered $errors errors"
+
+    if [ "$DRY_RUN" = true ]; then
+        log_message "Dry-run summary: Processed $count items, would move $moved files"
+    else
+        log_message "Summary: Processed $count items, moved $moved files, encountered $errors errors"
+    fi
     return 0
 }
 
@@ -540,7 +591,14 @@ check_cache_usage() {
 main() {
     # Initialize logging
     initialize_logging
-    
+
+    # Announce dry-run mode if enabled
+    if [ "$DRY_RUN" = true ]; then
+        log_message "========================================="
+        log_message "DRY-RUN MODE - No files will be moved"
+        log_message "========================================="
+    fi
+
     # Check for jq
     if ! check_jq; then
         log_message "Error: jq is required but not installed"
@@ -596,6 +654,14 @@ main() {
         fi
     else
         log_message "Cache usage (${cache_usage}%) is below threshold (${CACHE_THRESHOLD}%), no action needed"
+    fi
+
+    # Dry-run completion message
+    if [ "$DRY_RUN" = true ]; then
+        log_message "========================================="
+        log_message "DRY-RUN COMPLETE"
+        log_message "To actually move files, run without --dry-run"
+        log_message "========================================="
     fi
 }
 
