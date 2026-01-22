@@ -1,112 +1,80 @@
-# Unraid Smart Mover for Jellyfin
+# Unraid Smart Mover
 
-A smart file management script for Unraid servers running Jellyfin that automatically moves watched media content from your cache drive to your array, helping to optimize storage usage and maintain system performance.
+This application integrates with Jellyfin and Unraid's mover to intelligently manage media files between cache and array storage. It moves files from cache to array only after they've been played in Jellyfin and when the cache usage exceeds 90%.
 
 ## Features
 
-- Automatically detects and moves watched media content from cache to array
-- Monitors cache usage to prevent overflow
-- Supports multiple Jellyfin users
-- Cleans up empty directories after moving files
-- Configurable thresholds and limits
-- Detailed logging for monitoring operations
+- Monitors cache disk usage
+- Integrates with Jellyfin API to track played media
+- Moves files only when cache reaches 90% capacity
+- Includes logging and retry mechanisms
+- Runs as a scheduled service
 
-## Prerequisites
+## Setup
 
-- Unraid server with cache drive and array configured
-- Jellyfin media server installed and running
-- `bash` shell
-- `curl` for API requests
-- `jq` for JSON processing
-
-## Installation
-
-### Primary Method - User Scripts Plugin
-1. Install the User Scripts plugin from the Unraid Community Applications (CA)
-2. In the Unraid dashboard, go to Settings → User Scripts
-3. Click "ADD NEW SCRIPT" and give it a name (e.g., "Jellyfin Smart Mover")
-4. Copy the entire contents of `jellyfin_smart_mover.sh` and paste it into the script editor
-5. Click "SAVE CHANGES"
-
-You can also set up a schedule for the script to run automatically:
-1. Click on the schedule icon (clock) next to your script
-2. Select your desired schedule (e.g., daily, hourly, custom cron)
-3. Click "SAVE"
-
-### Alternative Methods
-- Clone this repository to your Unraid server
-- Download and manually copy the script to your preferred location
-
-## Configuration
-
-1. Edit `jellyfin_smart_mover.sh` and configure the following variables:
-
-```bash
-JELLYFIN_URL="http://your.jellyfin.server:8096"
-JELLYFIN_API_KEY=""  # Your Jellyfin API key
-CACHE_PATH="/mnt/cache"
-ARRAY_PATH="/mnt/disk1"
-MAX_FILES=1  # Set to 0 for no limit
-CACHE_THRESHOLD=75  # Percentage threshold for cache usage
-
-# Add your Jellyfin user IDs
-declare -a JELLYFIN_USER_IDS=(
-    "your-user-id-here"
-    "another-user-id-here"
-)
+1. Create a `.env` file in the same directory with the following variables:
+```
+JELLYFIN_URL=http://your-jellyfin-server:8096
+JELLYFIN_API_KEY=your-jellyfin-api-key
+CACHE_PATH=/mnt/cache
+ARRAY_PATH=/mnt/disk1
 ```
 
-### Getting Your Jellyfin API Key
+## Array Path Selection
 
-1. Log in to your Jellyfin server as an administrator
-2. Go to Dashboard → API Keys
-3. Create a new API key and copy it
-4. Paste the API key into the `JELLYFIN_API_KEY` variable in the script
+The `ARRAY_PATH` determines where files are moved when clearing the cache. Choose based on your needs:
 
-### Finding User IDs
+### Option 1: Direct Disk Path (Recommended)
+```
+ARRAY_PATH=/mnt/disk1
+```
+- Writes files directly to a specific disk
+- Guarantees files go to that exact disk
+- Use `/mnt/disk2`, `/mnt/disk3`, etc. for other disks
+- **Best for:** Users who want predictable, controlled file placement
 
-1. Log in to Jellyfin as an administrator
-2. Go to Dashboard → Users
-3. Click on a user
-4. The user ID is in the URL (the long string of characters)
+### Option 2: User Share with Cache Bypass (Unraid 6.9+)
+```
+ARRAY_PATH=/mnt/user0
+```
+- Files go to array via user share, bypassing cache
+- Unraid distributes files across disks based on your allocation method
+- Respects split levels and allocation settings
+- **Best for:** Users who want Unraid to manage disk distribution automatically
 
-## Usage
+### Option 3: Standard User Share - NOT RECOMMENDED
+```
+ARRAY_PATH=/mnt/user    # WARNING!
+```
+- **Do not use** - this path includes the cache drive
+- Files may be written back to cache, defeating the purpose of moving them
+- Only use if you fully understand the implications
 
-1. If you used the User Scripts plugin, the script will run automatically according to your schedule.
-2. If you used an alternative method, make the script executable:
+2. Install the required dependencies:
 ```bash
-chmod +x jellyfin_smart_mover.sh
+pip install -r requirements.txt
 ```
 
-3. Run the script:
+3. Make the script executable:
 ```bash
-./jellyfin_smart_mover.sh
+chmod +x smart_mover.py
 ```
 
-For automated execution, you can also set up a cron job.
+4. Run the application:
+```bash
+./smart_mover.py
+```
 
-## How It Works
+## Logging
 
-1. The script queries the Jellyfin API for each configured user to get their watched media items
-2. It checks if the cache drive usage is above the configured threshold
-3. If the cache needs to be cleared, it moves watched media files from the cache to the array
-4. After moving files, it cleans up any empty directories
-5. All operations are logged for monitoring
+Logs are stored in `smart_mover.log` with automatic rotation at 10MB and 30-day retention.
 
-## Safety Features
+## Operation
 
-- Checks for ongoing parity check/rebuild operations before running
-- Checks for active mover operations before running
-- Checks cache usage before operations
-- Verifies file existence before moving
-- Uses safe move operations
-- Maintains file permissions and ownership
-- Cleans up temporary files after execution
-
-## Contributing
-
-Feel free to submit issues and pull requests to improve the script.
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+The script will:
+1. Check cache disk usage every hour
+2. If usage is above 90%, it will:
+   - Fetch played items from Jellyfin
+   - Identify matching files in cache
+   - Move played files to the array
+3. All operations are logged and include retry mechanisms for reliability

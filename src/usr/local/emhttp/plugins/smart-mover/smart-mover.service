@@ -1,0 +1,14 @@
+[Unit]
+Description=Smart Mover Service for Unraid
+After=network.target jellyfin.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/emhttp/plugins/smart-mover/smart_mover.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/smart-mover.log
+StandardError=append:/var/log/smart-mover.log
+
+[Install]
+WantedBy=multi-user.target

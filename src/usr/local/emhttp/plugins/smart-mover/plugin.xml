@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Containers>
+  <Plugin>
+    <Name>Smart Mover</Name>
+    <Description>Intelligently move media files from cache to array based on Jellyfin playback status</Description>
+    <Author>Tim Fokker</Author>
+    <Version>1.0.0</Version>
+    <MinVer>6.9.0</MinVer>
+    <Project>https://github.com/yourusername/smart-mover</Project>
+    <Date>2024-02-19</Date>
+    <Changes>
+      Initial release
+    </Changes>
+    <Category>Utilities</Category>
+    <Icon>film</Icon>
+  </Plugin>
+</Containers>

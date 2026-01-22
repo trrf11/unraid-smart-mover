@@ -1,366 +1,569 @@
 #!/bin/bash
 
-# Configuration
-JELLYFIN_URL="http://[ADD_LOCAL_JELLYFIN_SERVER_HERE]:8096"
-JELLYFIN_API_KEY=""  # You'll need to fill this in
-CACHE_PATH="/mnt/cache"
-ARRAY_PATH="/mnt/disk1" #You'll need to check the ARRAY_PATH path for your specific case
-MAX_FILES=1  # Set to 0 for no limit
-CACHE_THRESHOLD=75  # Percentage threshold for cache usage
+#########################################
+##        Jellyfin Smart Mover        ##
+#########################################
+#
+# Description: Moves media files from cache to array based on Jellyfin playback status
+# Author: Tim Fokker
+# Date: 2024-02-21
+#
+# Requirements:
+# - jq: Install through Community Applications -> NerdPack
+#   OR run: curl -L -o /usr/local/bin/jq https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64 && chmod +x /usr/local/bin/jq
+#
+# Variables:
+JELLYFIN_URL="http://localhost:8096"  # Change this to your Jellyfin server URL
+JELLYFIN_API_KEY=""                   # Your Jellyfin API key
+JELLYFIN_USER_ID=""                   # Your Jellyfin user ID
+CACHE_THRESHOLD=90                    # Percentage of cache usage that triggers moving files
+CACHE_DRIVE="/mnt/cache"
+DEBUG=true                            # Set to true to enable debug logging
 
-# User IDs - add more as needed
-declare -a JELLYFIN_USER_IDS=(
-    "YOUR_FIRST_USER_ID_HERE"  # First user
-    "YOUR_SECOND_USER_ID_HERE"           # Second user - replace with actual ID
-)
+#########################################
+##       ARRAY_PATH Configuration      ##
+#########################################
+#
+# Choose where files should be moved when clearing cache. Three options:
+#
+# OPTION 1: Direct Disk Path (Default - Recommended for most users)
+#   ARRAY_PATH="/mnt/disk1"
+#   - Files are written directly to a specific disk
+#   - Guarantees files go to that exact disk
+#   - Use /mnt/disk2, /mnt/disk3, etc. for other disks
+#   - Best for: Users who want predictable, controlled file placement
+#
+# OPTION 2: User Share with Cache Bypass (Requires Unraid 6.9+)
+#   ARRAY_PATH="/mnt/user0"
+#   - Files go to array via user share, bypassing cache
+#   - Unraid distributes files across disks based on allocation method
+#   - Respects split levels and allocation settings
+#   - Best for: Users who want Unraid to manage disk distribution
+#
+# OPTION 3: Standard User Share - DO NOT USE!
+#   ARRAY_PATH="/mnt/user"   # WARNING: Can write back to cache!
+#   - This path includes the cache drive
+#   - Files may be written back to cache, defeating the purpose
+#   - Only use if you understand the implications
+#
+ARRAY_PATH="/mnt/disk1"
 
-# Create temporary directory for our files
-TEMP_DIR=$(mktemp -d)
-RESPONSE_FILE="$TEMP_DIR/jellyfin_response.json"
-MERGED_FILE="$TEMP_DIR/merged_items.json"
-trap 'rm -rf "$TEMP_DIR"' EXIT
+# Script configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_FILE="$SCRIPT_DIR/jellyfin_smart_mover.log"
 
-# Function to log messages with timestamp
+# Function to log messages to both console and file
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local message="[$timestamp] $1"
+    echo "$message" | tee -a "$LOG_FILE"
 }
 
-# Function to get played items from Jellyfin for a specific user
-get_user_played_items() {
-    local user_id="$1"
-    local output_file="$2"
+# Initialize log file
+initialize_logging() {
+    # Create log file if it doesn't exist
+    if [ ! -f "$LOG_FILE" ]; then
+        touch "$LOG_FILE"
+    fi
     
-    log_message "Getting played items for user: $user_id"
+    # Add script start marker to log
+    log_message "=== Script started at $(date '+%Y-%m-%d %H:%M:%S') ==="
+    log_message "Using log file: $LOG_FILE"
+}
+
+# Function to log debug messages
+debug_log() {
+    log_message "DEBUG: $1"
+}
+
+# Function to log error messages
+error_log() {
+    log_message "ERROR: $1"
+}
+
+# Function to test API endpoints
+test_api_endpoints() {
+    log_message "DEBUG: Testing API connection..."
     
-    # Create URL with Fields=Path parameter
-    local api_url="$JELLYFIN_URL/Users/$user_id/Items"
-    local query_params="IsPlayed=true&IncludeItemTypes=Movie,Episode&Fields=Path&SortBy=LastPlayedDate&SortOrder=Descending&Recursive=true"
-    local full_url="${api_url}?${query_params}"
+    # Test base URL
+    local test_url="$JELLYFIN_URL/System/Info/Public"
+    log_message "DEBUG: Testing base URL: $test_url"
     
-    log_message "API URL: $full_url"
+    local tmp_response
+    tmp_response=$(mktemp)
+    local tmp_headers
+    tmp_headers=$(mktemp)
     
-    # Make the curl request
-    if ! curl -s -S \
+    # Test with simple GET request
+    if ! curl -s -f -o "$tmp_response" -D "$tmp_headers" \
         -H "X-MediaBrowser-Token: $JELLYFIN_API_KEY" \
         -H "Accept: application/json" \
-        "$full_url" > "$output_file" 2>/dev/null; then
-        
-        log_message "ERROR: Curl request failed for user $user_id"
+        "$test_url"; then
+        log_message "ERROR: Failed to connect to Jellyfin server at $JELLYFIN_URL"
+        rm -f "$tmp_response" "$tmp_headers"
         return 1
     fi
     
-    # Check if we got a response
-    if [ ! -s "$output_file" ]; then
-        log_message "ERROR: Empty response from API for user $user_id"
+    # Get HTTP status code
+    local status_code
+    status_code=$(grep -i "^HTTP" "$tmp_headers" | tail -n1 | awk '{print $2}')
+    
+    if [ "$status_code" != "200" ]; then
+        log_message "ERROR: Server returned status code $status_code"
+        rm -f "$tmp_response" "$tmp_headers"
         return 1
     fi
     
-    # Validate JSON and get total count
-    if ! total_items=$(jq '.Items | length' "$output_file" 2>/dev/null); then
-        log_message "ERROR: Invalid JSON response for user $user_id"
-        log_message "Response content:"
-        head -n 50 "$output_file"
+    # Test user endpoint
+    local user_url="$JELLYFIN_URL/Users/$JELLYFIN_USER_ID"
+    log_message "DEBUG: Testing user endpoint: $user_url"
+    
+    if ! curl -s -f -o "$tmp_response" -D "$tmp_headers" \
+        -H "X-MediaBrowser-Token: $JELLYFIN_API_KEY" \
+        -H "Accept: application/json" \
+        "$user_url"; then
+        log_message "ERROR: Failed to access user endpoint. Check JELLYFIN_USER_ID"
+        rm -f "$tmp_response" "$tmp_headers"
         return 1
     fi
     
-    log_message "Total played items found for user $user_id: $total_items"
+    # Get HTTP status code for user endpoint
+    status_code=$(grep -i "^HTTP" "$tmp_headers" | tail -n1 | awk '{print $2}')
+    
+    if [ "$status_code" != "200" ]; then
+        log_message "ERROR: User endpoint returned status code $status_code"
+        rm -f "$tmp_response" "$tmp_headers"
+        return 1
+    fi
+    
+    # Test items endpoint with minimal query
+    local items_url="$JELLYFIN_URL/Users/$JELLYFIN_USER_ID/Items?Limit=1"
+    log_message "DEBUG: Testing items endpoint: $items_url"
+    
+    if ! curl -s -f -o "$tmp_response" -D "$tmp_headers" \
+        -H "X-MediaBrowser-Token: $JELLYFIN_API_KEY" \
+        -H "Accept: application/json" \
+        "$items_url"; then
+        log_message "ERROR: Failed to access items endpoint"
+        rm -f "$tmp_response" "$tmp_headers"
+        return 1
+    fi
+    
+    # Validate JSON response
+    if ! jq empty "$tmp_response" > /dev/null 2>&1; then
+        log_message "ERROR: Invalid JSON response from items endpoint"
+        log_message "DEBUG: Raw response: $(cat "$tmp_response")"
+        rm -f "$tmp_response" "$tmp_headers"
+        return 1
+    fi
+    
+    log_message "DEBUG: All API endpoints tested successfully"
+    rm -f "$tmp_response" "$tmp_headers"
     return 0
 }
 
-# Function to get played items from all users
+# Function to make API call with logging
+make_api_call() {
+    local url="$1"
+    local method="$2"
+    local description="$3"
+    
+    log_message "DEBUG: Making $method request to: $url at $(date '+%Y-%m-%d %H:%M:%S')"
+    log_message "DEBUG: Request headers: X-MediaBrowser-Token: [hidden], Accept: application/json"
+    
+    # Create temporary files
+    local tmp_response
+    tmp_response=$(mktemp)
+    local tmp_final
+    tmp_final=$(mktemp)
+    local tmp_headers
+    tmp_headers=$(mktemp)
+    
+    # Ensure temp files are cleaned up
+    trap 'rm -f "$tmp_response" "$tmp_final" "$tmp_headers"' EXIT
+    
+    # Make the curl call with verbose output for debugging
+    if ! curl -v -s -w "\n%{http_code}" \
+        -X "$method" \
+        -H "X-MediaBrowser-Token: $JELLYFIN_API_KEY" \
+        -H "Accept: application/json" \
+        "$url" 2>"$tmp_headers" > "$tmp_response"; then
+        log_message "ERROR: Curl command failed for $description"
+        log_message "DEBUG: Curl headers: $(cat "$tmp_headers")"
+        return 1
+    fi
+    
+    # Extract status code from last line and remove it from response
+    local status_code
+    status_code=$(tail -n1 "$tmp_response")
+    head -n -1 "$tmp_response" > "$tmp_final"
+    
+    log_message "DEBUG: API response code for $description: $status_code"
+    log_message "DEBUG: Curl headers: $(cat "$tmp_headers")"
+    
+    # Log response body for debugging (truncated if too long)
+    local response_preview
+    response_preview=$(head -c 500 "$tmp_final")
+    log_message "DEBUG: First 500 chars of response: $response_preview"
+    
+    if [ "$status_code" != "200" ]; then
+        log_message "ERROR: API call failed for $description. Status code: $status_code"
+        log_message "DEBUG: Full response body: $(cat "$tmp_final")"
+        return 1
+    fi
+    
+    cat "$tmp_final"
+    return 0
+}
+
+# Function to get played items from Jellyfin
 get_played_items() {
-    local temp_response
-    local first=true
-    local all_items=""
+    log_message "DEBUG: Starting get_played_items function at $(date '+%Y-%m-%d %H:%M:%S')"
     
-    # Process each user
-    for user_id in "${JELLYFIN_USER_IDS[@]}"; do
-        temp_response="$TEMP_DIR/response_${user_id}.json"
-        
-        if get_user_played_items "$user_id" "$temp_response"; then
-            # Extract items and append to all_items
-            if [ "$first" = true ]; then
-                all_items=$(jq -c '.Items[]' "$temp_response")
-                first=false
-            else
-                all_items="$all_items"$'\n'$(jq -c '.Items[]' "$temp_response")
-            fi
-        else
-            log_message "WARNING: Failed to get items for user $user_id, continuing with other users"
-        fi
-    done
+    # Create temporary files
+    local tmp_response
+    tmp_response=$(mktemp)
+    local tmp_paths
+    tmp_paths=$(mktemp)
+    local tmp_error
+    tmp_error=$(mktemp)
     
-    # Create final merged JSON with all items
-    if [ -n "$all_items" ]; then
-        # Convert newline-separated items into a JSON array and wrap in Items object
-        echo "$all_items" | jq -s '{"Items": .}' > "$RESPONSE_FILE"
-        
-        # Get total items
-        local total_items
-        total_items=$(echo "$all_items" | wc -l)
-        log_message "Total played items from all users: $total_items"
-        
-        # Display all paths for verification
-        log_message "Listing all played item paths from all users:"
-        log_message "----------------------------------------"
-        jq -r '.Items[] | select(.Path != null) | "Title: \(.Name)\nJellyfin Path: \(.Path)\n---"' "$RESPONSE_FILE"
-        log_message "----------------------------------------"
-        
+    # Ensure temp files are cleaned up
+    trap 'rm -f "$tmp_response" "$tmp_paths" "$tmp_error"' EXIT
+    
+    # Get the API response
+    local api_url="$JELLYFIN_URL/Users/$JELLYFIN_USER_ID/Items"
+    local query_params="IsPlayed=true&IncludeItemTypes=Movie,Episode&SortBy=LastPlayedDate&SortOrder=Descending&Recursive=true"
+    local full_url="${api_url}?${query_params}"
+    
+    log_message "DEBUG: API request details at $(date '+%Y-%m-%d %H:%M:%S'):"
+    log_message "DEBUG: Base URL: $JELLYFIN_URL"
+    log_message "DEBUG: User ID: $JELLYFIN_USER_ID"
+    log_message "DEBUG: Full URL: $full_url"
+    
+    # Make the API call and save to temp file
+    log_message "DEBUG: Making API call to get played items..."
+    if ! make_api_call "$full_url" "GET" "Getting played items" > "$tmp_response"; then
+        log_message "ERROR: API call failed at $(date '+%Y-%m-%d %H:%M:%S')"
+        log_message "DEBUG: API response saved to: $tmp_response"
+        log_message "DEBUG: Response content: $(cat "$tmp_response")"
+        return 1
+    fi
+
+    # Verify we got a response
+    if [ ! -s "$tmp_response" ]; then
+        log_message "ERROR: Empty response from API at $(date '+%Y-%m-%d %H:%M:%S')"
+        return 1
+    fi
+
+    log_message "DEBUG: Successfully received API response at $(date '+%Y-%m-%d %H:%M:%S')"
+    log_message "DEBUG: Response file size: $(wc -c < "$tmp_response") bytes"
+    log_message "DEBUG: First 500 chars of response: $(head -c 500 "$tmp_response")"
+
+    # Process the response with jq and show the command for debugging
+    local jq_cmd='.Items[] | select(.Path != null) | .Path'
+    log_message "DEBUG: Running jq command at $(date '+%Y-%m-%d %H:%M:%S'): $jq_cmd"
+    
+    if ! jq -r "$jq_cmd" "$tmp_response" > "$tmp_paths" 2> "$tmp_error"; then
+        log_message "ERROR: Failed to parse played items JSON at $(date '+%Y-%m-%d %H:%M:%S')"
+        log_message "DEBUG: JQ Error: $(cat "$tmp_error")"
+        log_message "DEBUG: Response data: $(cat "$tmp_response")"
+        return 1
+    fi
+
+    # Handle empty results
+    if [ ! -s "$tmp_paths" ]; then
+        log_message "DEBUG: No played items found in response at $(date '+%Y-%m-%d %H:%M:%S')"
         return 0
-    else
-        log_message "ERROR: No valid items found from any user"
-        return 1
     fi
+
+    # Log number of items found
+    local item_count
+    item_count=$(wc -l < "$tmp_paths")
+    log_message "DEBUG: Found $item_count played items at $(date '+%Y-%m-%d %H:%M:%S')"
+
+    # Output the paths
+    cat "$tmp_paths"
+    return 0
 }
 
-# Function to convert Jellyfin path to cache path
-convert_to_cache_path() {
-    local jellyfin_path="$1"
+# Function to process a single item
+process_item() {
+    local item_path="$1"
+    local cache_usage="$2"
     
-    # If path starts with /media/media, remove it
-    local relative_path="${jellyfin_path#/media/media/}"
-    
-    # If there was no /media/media prefix, try removing mount points
-    if [ "$relative_path" = "$jellyfin_path" ]; then
-        relative_path="${jellyfin_path#/mnt/disk1/}"
-        relative_path="${relative_path#/mnt/user/}"
-    fi
-    
-    # Construct cache path
-    echo "$CACHE_PATH/media/$relative_path"
-}
-
-# Function to convert Jellyfin path to array path
-convert_to_array_path() {
-    local jellyfin_path="$1"
-    
-    # If path starts with /media/media, remove it
-    local relative_path="${jellyfin_path#/media/media/}"
-    
-    # If there was no /media/media prefix, try removing mount points
-    if [ "$relative_path" = "$jellyfin_path" ]; then
-        relative_path="${jellyfin_path#/mnt/disk1/}"
-        relative_path="${relative_path#/mnt/user/}"
-    fi
-    
-    # Construct array path
-    echo "$ARRAY_PATH/media/$relative_path"
-}
-
-# Function to check cache usage percentage
-check_cache_usage() {
-    local total_space used_space usage_percent
-    
-    # Get cache drive space info
-    if ! df_output=$(df -P "$CACHE_PATH" 2>/dev/null); then
-        log_message "ERROR: Failed to get cache drive information"
-        return 1
-    fi
-    
-    # Extract usage percentage (use awk to get the percentage from the last line)
-    usage_percent=$(echo "$df_output" | awk 'NR==2 {print $5}' | sed 's/%//')
-    
-    if [ -z "$usage_percent" ]; then
-        log_message "ERROR: Failed to calculate cache usage percentage"
-        return 1
-    fi
-    
-    log_message "Current cache usage: $usage_percent%"
-    log_message "Cache threshold: $CACHE_THRESHOLD%"
-    
-    # Return true (0) if usage is above threshold, false (1) if below
-    if [ "$usage_percent" -ge "$CACHE_THRESHOLD" ]; then
-        log_message "Cache usage is above threshold, will process files"
-        return 0
-    else
-        log_message "Cache usage is below threshold, no action needed"
-        return 1
-    fi
-}
-
-# Function to safely move file using rsync
-safe_move_file() {
-    local source="$1"
-    local dest="$2"
-    
-    # rsync flags:
-    # -a: archive mode (preserves permissions, timestamps, etc.)
-    # -v: verbose
-    # -h: human-readable sizes
-    # -P: show progress and allow resume
-    # --remove-source-files: delete source file after successful transfer
-    # --checksum: verify file integrity
-    
-    log_message "  Starting rsync transfer..."
-    if rsync -avhP --remove-source-files --checksum "$source" "$dest" 2>&1; then
-        # Check if source file is gone (indicating successful move)
-        if [ ! -f "$source" ]; then
-            log_message "  Transfer completed and verified"
-            return 0
-        else
-            log_message "  ERROR: Source file still exists after transfer"
-            return 1
-        fi
-    else
-        log_message "  ERROR: rsync transfer failed"
-        return 1
-    fi
-}
-
-# Function to check and remove empty directories
-cleanup_empty_dirs() {
-    local dir="$1"
-    local base_cache_dir="$CACHE_PATH/media"
-    
-    # Don't try to remove the base media directory
-    if [ "$dir" = "$base_cache_dir" ]; then
+    # Skip empty paths or debug messages
+    if [ -z "$item_path" ] || [[ "$item_path" == *"DEBUG:"* ]] || [[ "$item_path" == *"ERROR:"* ]]; then
         return 0
     fi
     
-    # Check if directory is empty
-    if [ -d "$dir" ] && [ -z "$(ls -A "$dir")" ]; then
-        log_message "  Found empty directory: $dir"
-        if rmdir "$dir" 2>/dev/null; then
-            log_message "  Removed empty directory"
-            # Recursively check parent directory
-            cleanup_empty_dirs "$(dirname "$dir")"
-        else
-            log_message "  WARNING: Failed to remove empty directory"
-        fi
+    log_message "DEBUG: Processing item: $item_path"
+    
+    # Check if file exists
+    if [ ! -f "$item_path" ]; then
+        log_message "DEBUG: Skipping $item_path - file not found"
+        return 0
+    fi
+    
+    # Check if file is on cache drive
+    if [[ "$item_path" != "$CACHE_DRIVE"* ]]; then
+        log_message "DEBUG: Skipping $item_path - not on cache drive"
+        return 0
+    fi
+    
+    # Get target path on array
+    local rel_path="${item_path#$CACHE_DRIVE/}"
+    local array_path="$ARRAY_PATH/$rel_path"
+    
+    # Check if target already exists
+    if [ -f "$array_path" ]; then
+        log_message "DEBUG: Target file already exists: $array_path"
+        return 0
+    fi
+    
+    log_message "DEBUG: Moving $item_path to $array_path"
+    
+    # Create target directory if it doesn't exist
+    local target_dir
+    target_dir=$(dirname "$array_path")
+    if ! mkdir -p "$target_dir"; then
+        log_message "ERROR: Failed to create target directory: $target_dir"
+        return 1
+    fi
+    
+    # Move file
+    if mv "$item_path" "$array_path"; then
+        log_message "Successfully moved: $item_path to array"
+        return 0
+    else
+        log_message "ERROR: Failed to move $item_path to $array_path"
+        return 1
     fi
 }
 
-# Function to process played items
+# Function to process all played items
 process_played_items() {
-    local moved_count=0
-    local skipped_count=0
-    local error_count=0
+    local cache_usage=$1
+    local count=0
+    local moved=0
+    local errors=0
     
-    log_message "Processing played items..."
-    log_message "Will move up to $MAX_FILES files"
+    log_message "DEBUG: Processing played items with cache usage at $cache_usage%"
     
-    # Read paths from response file
-    while IFS= read -r jellyfin_path; do
-        # Check if we've moved enough files
-        if [ "$MAX_FILES" -gt 0 ] && [ "$moved_count" -ge "$MAX_FILES" ]; then
-            log_message "Reached target number of moved files ($MAX_FILES), stopping..."
-            break
-        fi
-        
-        if [ -z "$jellyfin_path" ]; then
+    # Create temporary file for played items
+    local tmp_items
+    tmp_items=$(mktemp)
+    
+    # Ensure temp file is cleaned up
+    trap 'rm -f "$tmp_items"' EXIT
+    
+    # Get list of played items and save to temp file
+    if ! get_played_items > "$tmp_items"; then
+        log_message "ERROR: Failed to get played items list"
+        return 1
+    fi
+
+    # If no items found, exit successfully
+    if [ ! -s "$tmp_items" ]; then
+        log_message "DEBUG: No items to process"
+        return 0
+    fi
+
+    # Process each item from the file
+    while IFS= read -r path; do
+        # Skip empty lines and debug/error messages
+        if [ -z "$path" ] || [[ "$path" == *"DEBUG:"* ]] || [[ "$path" == *"ERROR:"* ]]; then
             continue
         fi
         
-        # Convert paths
-        local cache_path=$(convert_to_cache_path "$jellyfin_path")
-        local array_path=$(convert_to_array_path "$jellyfin_path")
+        count=$((count + 1))
+        log_message "DEBUG: Processing item $count: $path"
         
-        log_message "Processing file:"
-        log_message "  Original path: $jellyfin_path"
-        log_message "  Cache path: $cache_path"
-        log_message "  Array path: $array_path"
-        
-        if [ -f "$cache_path" ]; then
-            log_message "  File found on cache, checking target directory..."
-            
-            # Check if target directory exists and create if needed
-            local target_dir=$(dirname "$array_path")
-            if [ ! -d "$target_dir" ]; then
-                log_message "  Target directory does not exist, creating: $target_dir"
-                if ! mkdir -p "$target_dir"; then
-                    log_message "  ERROR: Failed to create target directory"
-                    ((error_count++))
-                    log_message "  ---"
-                    continue
-                fi
-                log_message "  Successfully created target directory"
-            fi
-            
-            log_message "  Moving file..."
-            if safe_move_file "$cache_path" "$array_path"; then
-                log_message "  SUCCESS: Moved file to array"
-                ((moved_count++))
-                log_message "  Successfully moved $moved_count of $MAX_FILES files"
-                
-                # Check and cleanup empty directories after successful move
-                log_message "  Checking for empty directories..."
-                cleanup_empty_dirs "$(dirname "$cache_path")"
-            else
-                log_message "  ERROR: Failed to move file"
-                ((error_count++))
-            fi
+        if process_item "$path" "$cache_usage"; then
+            moved=$((moved + 1))
         else
-            log_message "  File not found on cache, skipping"
-            ((skipped_count++))
+            errors=$((errors + 1))
         fi
-        log_message "  ---"
-    done < <(jq -r '.Items[] | select(.Path != null) | .Path' "$RESPONSE_FILE")
+    done < "$tmp_items"
     
-    # Print summary
-    log_message "----------------------------------------"
-    log_message "Processing complete!"
-    log_message "Files moved to array: $moved_count"
-    log_message "Files not on cache: $skipped_count"
-    log_message "Errors encountered: $error_count"
-    log_message "----------------------------------------"
-}
-
-# Function to check for ongoing system operations
-check_system_operations() {
-    # Check for ongoing parity check/rebuild
-    if [ -f "/proc/mdcmd" ]; then
-        if grep -q "check\|rebuild" /proc/mdcmd; then
-            log_message "ERROR: Parity check or rebuild is in progress. Aborting."
-            return 1
-        fi
-    fi
-
-    # Check for active mover operations
-    if [ -f "/var/run/mover.pid" ]; then
-        if kill -0 "$(cat /var/run/mover.pid)" 2>/dev/null; then
-            log_message "ERROR: Mover is currently running. Aborting."
-            return 1
-        fi
-    fi
-
+    log_message "Summary: Processed $count items, moved $moved files, encountered $errors errors"
     return 0
 }
 
-# Main execution
-log_message "=== Starting Jellyfin Smart Mover ==="
+# Function to validate environment
+validate_environment() {
+    set -e  # Exit on error
+    trap 'log_message "ERROR: An error occurred in validate_environment at line $LINENO"' ERR
+    
+    log_message "DEBUG: Validating environment..."
+    
+    # Check required environment variables
+    if [ -z "$JELLYFIN_URL" ]; then
+        log_message "ERROR: JELLYFIN_URL is not set"
+        return 1
+    fi
+    log_message "DEBUG: JELLYFIN_URL is set to: $JELLYFIN_URL"
+    
+    if [ -z "$JELLYFIN_API_KEY" ]; then
+        log_message "ERROR: JELLYFIN_API_KEY is not set"
+        return 1
+    fi
+    log_message "DEBUG: JELLYFIN_API_KEY is set (value hidden)"
+    
+    if [ -z "$JELLYFIN_USER_ID" ]; then
+        log_message "ERROR: JELLYFIN_USER_ID is not set"
+        return 1
+    fi
+    log_message "DEBUG: JELLYFIN_USER_ID is set to: $JELLYFIN_USER_ID"
+    
+    # Test Jellyfin connection
+    log_message "DEBUG: Testing Jellyfin connection..."
+    local test_response
+    test_response=$(make_api_call "$JELLYFIN_URL/System/Info" "GET" "System Info")
+    if [ $? -ne 0 ]; then
+        log_message "ERROR: Failed to connect to Jellyfin server"
+        return 1
+    fi
+    log_message "DEBUG: System Info response: $test_response"
+    
+    # Validate user ID exists
+    log_message "DEBUG: Validating user ID..."
+    local user_test
+    user_test=$(make_api_call "$JELLYFIN_URL/Users/$JELLYFIN_USER_ID" "GET" "User Info")
+    if [ $? -ne 0 ]; then
+        log_message "ERROR: Invalid user ID: $JELLYFIN_USER_ID"
+        log_message "DEBUG: User Info response: $user_test"
+        return 1
+    fi
+    log_message "DEBUG: User Info response: $user_test"
+    
+    log_message "DEBUG: Successfully connected to Jellyfin server"
+    
+    # Log environment settings
+    log_message "DEBUG: Environment settings:"
+    log_message "DEBUG: - CACHE_DRIVE=$CACHE_DRIVE"
+    log_message "DEBUG: - ARRAY_PATH=$ARRAY_PATH"
+    log_message "DEBUG: - CACHE_THRESHOLD=$CACHE_THRESHOLD"
+    
+    return 0
+}
 
-# Check for ongoing system operations
-if ! check_system_operations; then
-    log_message "Exiting due to ongoing system operations"
-    exit 1
-fi
+# Function to check and install jq if needed
+check_jq() {
+    if ! command -v jq &> /dev/null; then
+        log_message "jq not found. Attempting to install..."
+        if curl -L -o /usr/local/bin/jq https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64; then
+            chmod +x /usr/local/bin/jq
+            log_message "jq installed successfully"
+        else
+            log_message "ERROR: Failed to install jq. Please install it manually through the NerdPack plugin"
+            log_message "Or run: curl -L -o /usr/local/bin/jq https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64 && chmod +x /usr/local/bin/jq"
+            exit 1
+        fi
+    fi
+}
 
-# Check if API key is set
-if [ -z "$JELLYFIN_API_KEY" ]; then
-    log_message "ERROR: Please set JELLYFIN_API_KEY first"
-    exit 1
-fi
+# Function to check if mover is running
+is_mover_running() {
+    if [ -f /var/run/mover.pid ]; then
+        if kill -0 $(cat /var/run/mover.pid) 2>/dev/null; then
+            return 0  # Mover is running
+        fi
+    fi
+    return 1  # Mover is not running
+}
 
-# Check cache usage first
-log_message "Checking cache usage..."
-if ! check_cache_usage; then
-    log_message "Cache usage is below threshold, no action needed"
-    exit 0
-fi
+# Function to check if parity check is running
+is_parity_running() {
+    if [ -f /proc/mdstat ]; then
+        if grep -q "resync" /proc/mdstat; then
+            return 0  # Parity check is running
+        fi
+    fi
+    return 1  # Parity check is not running
+}
 
-# If we get here, cache is above threshold
-log_message "Cache usage is above threshold, proceeding with file moves"
-log_message "Will process up to $MAX_FILES files"
+# Function to check cache usage
+check_cache_usage() {
+    local cache_path="$1"
+    local usage
+    
+    # Get disk usage percentage without logging
+    usage=$(df -h "$cache_path" | awk 'NR==2 {print $5}' | sed 's/%//')
+    
+    if [ -z "$usage" ]; then
+        log_message "ERROR: Could not determine cache usage"
+        return 1
+    fi
+    
+    # Return just the number
+    echo "$usage"
+    return 0
+}
 
-# Step 1: Get played items
-log_message "Step 1: Getting played items from Jellyfin"
-if ! get_played_items; then
-    log_message "Failed to get played items"
-    exit 1
-fi
+# Main function
+main() {
+    # Initialize logging
+    initialize_logging
+    
+    # Check for jq
+    if ! check_jq; then
+        log_message "Error: jq is required but not installed"
+        exit 1
+    fi
+    
+    # Validate environment first
+    if ! validate_environment; then
+        log_message "ERROR: Environment validation failed"
+        exit 1
+    fi
 
-# Step 2: Process items
-log_message "Step 2: Processing items for moving"
-process_played_items
+    # Debug: Print environment variables
+    log_message "DEBUG: Environment settings:"
+    log_message "DEBUG: - CACHE_DRIVE=$CACHE_DRIVE"
+    log_message "DEBUG: - ARRAY_PATH=$ARRAY_PATH"
+    log_message "DEBUG: - CACHE_THRESHOLD=$CACHE_THRESHOLD"
+    
+    # Validate required paths
+    if [ ! -d "$CACHE_DRIVE" ]; then
+        log_message "ERROR: Cache drive path does not exist: $CACHE_DRIVE"
+        exit 1
+    fi
+    
+    if [ ! -d "$ARRAY_PATH" ]; then
+        log_message "ERROR: Array path does not exist: $ARRAY_PATH"
+        exit 1
+    fi
 
-log_message "=== Process Complete ==="
+    # Check if mover is running
+    if is_mover_running; then
+        log_message "Mover is currently running, exiting"
+        exit 0
+    fi
+
+    # Check cache usage
+    log_message "DEBUG: Checking cache usage for $CACHE_DRIVE"
+    local cache_usage
+    cache_usage=$(check_cache_usage "$CACHE_DRIVE")
+    if [ $? -ne 0 ]; then
+        log_message "ERROR: Failed to check cache usage"
+        exit 1
+    fi
+    log_message "DEBUG: Cache usage is ${cache_usage}%"
+    log_message "Current cache usage: ${cache_usage}%"
+
+    # Only process if cache usage is above threshold
+    if [ "$cache_usage" -ge "$CACHE_THRESHOLD" ]; then
+        log_message "Cache usage (${cache_usage}%) is above threshold (${CACHE_THRESHOLD}%), processing played items"
+        if ! process_played_items "$cache_usage"; then
+            log_message "ERROR: Failed to process played items"
+            exit 1
+        fi
+    else
+        log_message "Cache usage (${cache_usage}%) is below threshold (${CACHE_THRESHOLD}%), no action needed"
+    fi
+}
+
+# Run main function
+main

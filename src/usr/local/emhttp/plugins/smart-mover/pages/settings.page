@@ -1,0 +1,52 @@
+Menu="Utilities"
+Title="Smart Mover"
+Icon="film"
+---
+<?php
+$smart_mover_cfg = parse_ini_file("/usr/local/emhttp/plugins/smart-mover/smart-mover.cfg");
+?>
+
+<form markdown="1" method="POST" action="/plugins/smart-mover/include/save_settings.php">
+
+Enable Smart Mover Service:
+: <select name="SERVICE_ENABLED">
+  <?php
+  $enabled = $smart_mover_cfg['SERVICE_ENABLED'];
+  echo "<option value='true' ".($enabled == 'true' ? 'selected' : '').">Yes</option>";
+  echo "<option value='false' ".($enabled == 'false' ? 'selected' : '').">No</option>";
+  ?>
+  </select>
+
+Check Interval (minutes):
+: <input type="number" name="CHECK_INTERVAL" value="<?php echo $smart_mover_cfg['CHECK_INTERVAL']; ?>" min="1" max="1440" required>
+  <span class="inline">How often to check for played media files (1-1440 minutes)</span>
+
+Cache Usage Threshold (%):
+: <input type="number" name="CACHE_THRESHOLD" value="<?php echo $smart_mover_cfg['CACHE_THRESHOLD']; ?>" min="1" max="99" required>
+  <span class="inline">Percentage of cache usage that triggers file movement (1-99%)</span>
+
+Jellyfin URL:
+: <input type="text" name="JELLYFIN_URL" value="<?php echo $smart_mover_cfg['JELLYFIN_URL']; ?>" required>
+  <span class="inline">Your Jellyfin server URL (e.g., http://localhost:8096)</span>
+
+Jellyfin API Key:
+: <input type="password" name="JELLYFIN_API_KEY" value="<?php echo $smart_mover_cfg['JELLYFIN_API_KEY']; ?>" required>
+  <span class="inline">Your Jellyfin API key</span>
+
+<input type="submit" value="Save">
+</form>
+
+&nbsp;
+<div id="title"><span class="left">Smart Mover Status</span></div>
+
+<?php
+$service_status = trim(shell_exec("systemctl is-active smart-mover.service"));
+$last_run = trim(shell_exec("journalctl -u smart-mover.service -n 1 --no-pager | tail -n 1"));
+?>
+
+<dl>
+  <dt>Service Status:</dt>
+  <dd><?php echo $service_status; ?></dd>
+  <dt>Last Run:</dt>
+  <dd><?php echo $last_run; ?></dd>
+</dl>
