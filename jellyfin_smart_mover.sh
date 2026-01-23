@@ -21,6 +21,17 @@ CACHE_DRIVE="/mnt/cache"
 DEBUG=true                            # Set to true to enable debug logging
 
 #########################################
+##       Media Pool Configuration      ##
+#########################################
+#
+# Configure your media pool paths. These are used to determine how files
+# are handled when moving (movies move entire folder, TV moves by episode).
+#
+# Set these to match your Unraid share names:
+MOVIES_POOL="movies-pool"             # Your movies share name (e.g., "movies", "films", "movies-pool")
+TV_POOL="tv-pool"                     # Your TV shows share name (e.g., "tv", "shows", "tv-pool")
+
+#########################################
 ##       ARRAY_PATH Configuration      ##
 #########################################
 #
@@ -137,9 +148,9 @@ is_subtitle_file() {
 get_media_type() {
     local path="$1"
 
-    if [[ "$path" == *"/movies-pool/"* ]]; then
+    if [[ "$path" == *"/$MOVIES_POOL/"* ]]; then
         echo "movie"
-    elif [[ "$path" == *"/tv-pool/"* ]]; then
+    elif [[ "$path" == *"/$TV_POOL/"* ]]; then
         echo "tv"
     else
         echo "unknown"
