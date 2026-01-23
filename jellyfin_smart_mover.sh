@@ -55,6 +55,9 @@ LOG_FILE="$SCRIPT_DIR/jellyfin_smart_mover.log"
 # Dry-run mode flag
 DRY_RUN=false
 
+# Subtitle file extensions
+SUBTITLE_EXTENSIONS="srt sub ass ssa vtt idx smi"
+
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -113,6 +116,195 @@ dry_run_log() {
     if [ "$DRY_RUN" = true ]; then
         log_message "[DRY-RUN] $1"
     fi
+}
+
+# Function to check if file has a subtitle extension
+is_subtitle_file() {
+    local file="$1"
+    local ext="${file##*.}"
+    ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+
+    for sub_ext in $SUBTITLE_EXTENSIONS; do
+        if [ "$ext" = "$sub_ext" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Function to detect media type based on path
+# Returns: "movie" for movies-pool, "tv" for tv-pool, "unknown" otherwise
+get_media_type() {
+    local path="$1"
+
+    if [[ "$path" == *"/movies-pool/"* ]]; then
+        echo "movie"
+    elif [[ "$path" == *"/tv-pool/"* ]]; then
+        echo "tv"
+    else
+        echo "unknown"
+    fi
+}
+
+# Function to extract S##E## pattern from filename
+# Returns the pattern (e.g., "S01E03") or empty string if not found
+extract_episode_pattern() {
+    local filename="$1"
+
+    # Match S##E## pattern (case insensitive)
+    if [[ "$filename" =~ [Ss]([0-9]{1,2})[Ee]([0-9]{1,2}) ]]; then
+        # Return uppercase normalized format
+        printf "S%02dE%02d" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    fi
+}
+
+# Function to move a single file (used by both movie and TV handlers)
+# Returns 0 on success, 1 on failure
+move_single_file() {
+    local source_path="$1"
+    local target_path="$2"
+    local file_type="$3"  # For logging: "video", "subtitle", "file"
+
+    # Check if target already exists
+    if [ -f "$target_path" ]; then
+        log_message "DEBUG: Target $file_type already exists: $target_path"
+        return 0
+    fi
+
+    # Create target directory if needed
+    local target_dir
+    target_dir=$(dirname "$target_path")
+
+    if [ "$DRY_RUN" = true ]; then
+        if [ ! -d "$target_dir" ]; then
+            dry_run_log "Would create directory: $target_dir"
+        fi
+        local file_size
+        file_size=$(du -h "$source_path" 2>/dev/null | cut -f1)
+        dry_run_log "Would move $file_type: $source_path ($file_size) -> $target_path"
+        return 0
+    else
+        if ! mkdir -p "$target_dir"; then
+            log_message "ERROR: Failed to create target directory: $target_dir"
+            return 1
+        fi
+
+        if mv "$source_path" "$target_path"; then
+            log_message "Successfully moved $file_type: $source_path"
+            return 0
+        else
+            log_message "ERROR: Failed to move $file_type: $source_path"
+            return 1
+        fi
+    fi
+}
+
+# Function to move associated subtitle files for TV episodes
+# Finds files in the same directory matching the S##E## pattern
+move_tv_subtitles() {
+    local video_path="$1"
+    local video_dir
+    video_dir=$(dirname "$video_path")
+    local video_filename
+    video_filename=$(basename "$video_path")
+
+    # Extract episode pattern from video filename
+    local episode_pattern
+    episode_pattern=$(extract_episode_pattern "$video_filename")
+
+    if [ -z "$episode_pattern" ]; then
+        log_message "DEBUG: No episode pattern found in $video_filename, skipping subtitle search"
+        return 0
+    fi
+
+    log_message "DEBUG: Looking for subtitles matching pattern $episode_pattern in $video_dir"
+
+    local subtitle_count=0
+
+    # Find all files in the same directory
+    for file in "$video_dir"/*; do
+        [ -f "$file" ] || continue
+
+        local filename
+        filename=$(basename "$file")
+
+        # Skip the video file itself
+        [ "$filename" = "$video_filename" ] && continue
+
+        # Check if it's a subtitle file
+        if ! is_subtitle_file "$filename"; then
+            continue
+        fi
+
+        # Check if it matches the episode pattern
+        local file_pattern
+        file_pattern=$(extract_episode_pattern "$filename")
+
+        if [ "$file_pattern" = "$episode_pattern" ]; then
+            log_message "DEBUG: Found matching subtitle: $filename"
+
+            # Calculate target path
+            local rel_path="${file#$CACHE_DRIVE/}"
+            local target_path="$ARRAY_PATH/$rel_path"
+
+            if move_single_file "$file" "$target_path" "subtitle"; then
+                subtitle_count=$((subtitle_count + 1))
+            fi
+        fi
+    done
+
+    if [ "$subtitle_count" -gt 0 ]; then
+        if [ "$DRY_RUN" = true ]; then
+            log_message "DEBUG: Would move $subtitle_count subtitle file(s) for $episode_pattern"
+        else
+            log_message "DEBUG: Moved $subtitle_count subtitle file(s) for $episode_pattern"
+        fi
+    fi
+
+    return 0
+}
+
+# Function to move entire movie folder
+move_movie_folder() {
+    local video_path="$1"
+    local movie_dir
+    movie_dir=$(dirname "$video_path")
+
+    log_message "DEBUG: Moving entire movie folder: $movie_dir"
+
+    local file_count=0
+
+    # Move all files in the movie directory
+    for file in "$movie_dir"/*; do
+        [ -f "$file" ] || continue
+
+        local filename
+        filename=$(basename "$file")
+
+        # Calculate target path
+        local rel_path="${file#$CACHE_DRIVE/}"
+        local target_path="$ARRAY_PATH/$rel_path"
+
+        # Determine file type for logging
+        local file_type="file"
+        if is_subtitle_file "$filename"; then
+            file_type="subtitle"
+        elif [[ "$file" = "$video_path" ]]; then
+            file_type="video"
+        fi
+
+        if move_single_file "$file" "$target_path" "$file_type"; then
+            file_count=$((file_count + 1))
+        fi
+    done
+
+    if [ "$DRY_RUN" = true ]; then
+        log_message "DEBUG: Would move $file_count file(s) from movie folder"
+    else
+        log_message "DEBUG: Moved $file_count file(s) from movie folder"
+    fi
+
+    return 0
 }
 
 # Function to validate API key format
@@ -359,68 +551,80 @@ get_played_items() {
 process_item() {
     local item_path="$1"
     local cache_usage="$2"
-    
+
     # Skip empty paths or debug messages
     if [ -z "$item_path" ] || [[ "$item_path" == *"DEBUG:"* ]] || [[ "$item_path" == *"ERROR:"* ]]; then
         return 0
     fi
-    
+
     log_message "DEBUG: Processing item: $item_path"
-    
+
     # Check if file exists
     if [ ! -f "$item_path" ]; then
         log_message "DEBUG: Skipping $item_path - file not found"
         return 0
     fi
-    
+
     # Check if file is on cache drive
     if [[ "$item_path" != "$CACHE_DRIVE"* ]]; then
         log_message "DEBUG: Skipping $item_path - not on cache drive"
         return 0
     fi
-    
-    # Get target path on array
-    local rel_path="${item_path#$CACHE_DRIVE/}"
-    local array_path="$ARRAY_PATH/$rel_path"
-    
-    # Check if target already exists
-    if [ -f "$array_path" ]; then
-        log_message "DEBUG: Target file already exists: $array_path"
-        return 0
-    fi
-    
-    log_message "DEBUG: Moving $item_path to $array_path"
 
-    # Create target directory if it doesn't exist
-    local target_dir
-    target_dir=$(dirname "$array_path")
+    # Detect media type and handle accordingly
+    local media_type
+    media_type=$(get_media_type "$item_path")
+    log_message "DEBUG: Detected media type: $media_type"
 
-    if [ "$DRY_RUN" = true ]; then
-        if [ ! -d "$target_dir" ]; then
-            dry_run_log "Would create directory: $target_dir"
-        fi
-    else
-        if ! mkdir -p "$target_dir"; then
-            log_message "ERROR: Failed to create target directory: $target_dir"
-            return 1
-        fi
-    fi
+    case "$media_type" in
+        movie)
+            # For movies, move the entire folder
+            log_message "DEBUG: Processing as movie - will move entire folder"
+            move_movie_folder "$item_path"
+            return $?
+            ;;
+        tv)
+            # For TV, move the video file then find and move matching subtitles
+            log_message "DEBUG: Processing as TV episode - will move video and matching subtitles"
 
-    # Move file
-    if [ "$DRY_RUN" = true ]; then
-        local file_size
-        file_size=$(du -h "$item_path" 2>/dev/null | cut -f1)
-        dry_run_log "Would move: $item_path ($file_size) -> $array_path"
-        return 0
-    else
-        if mv "$item_path" "$array_path"; then
-            log_message "Successfully moved: $item_path to array"
+            # Get target path on array for the video
+            local rel_path="${item_path#$CACHE_DRIVE/}"
+            local array_path="$ARRAY_PATH/$rel_path"
+
+            # Check if target already exists
+            if [ -f "$array_path" ]; then
+                log_message "DEBUG: Target video already exists: $array_path"
+                # Still check for subtitles that might need moving
+                move_tv_subtitles "$item_path"
+                return 0
+            fi
+
+            # Move the video file
+            if ! move_single_file "$item_path" "$array_path" "video"; then
+                return 1
+            fi
+
+            # Move associated subtitle files
+            move_tv_subtitles "$item_path"
             return 0
-        else
-            log_message "ERROR: Failed to move $item_path to $array_path"
-            return 1
-        fi
-    fi
+            ;;
+        *)
+            # Unknown media type - use legacy behavior (just move the file)
+            log_message "DEBUG: Unknown media type - moving single file only"
+
+            local rel_path="${item_path#$CACHE_DRIVE/}"
+            local array_path="$ARRAY_PATH/$rel_path"
+
+            # Check if target already exists
+            if [ -f "$array_path" ]; then
+                log_message "DEBUG: Target file already exists: $array_path"
+                return 0
+            fi
+
+            move_single_file "$item_path" "$array_path" "video"
+            return $?
+            ;;
+    esac
 }
 
 # Function to process all played items
