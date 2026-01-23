@@ -341,6 +341,45 @@ validate_api_key_format() {
     return 0
 }
 
+# Function to validate User ID format
+# Jellyfin User IDs are UUIDs (with or without dashes)
+validate_user_id_format() {
+    local user_id="$1"
+
+    # Check if empty
+    if [ -z "$user_id" ]; then
+        log_message "ERROR: JELLYFIN_USER_ID is empty"
+        log_message "ERROR: Please set your Jellyfin user ID in the script configuration"
+        log_message "ERROR: You can find your user ID in Jellyfin: Dashboard > Users > Click user > URL contains the ID"
+        return 1
+    fi
+
+    # Remove dashes for validation
+    local user_id_no_dashes="${user_id//-/}"
+
+    # Check length (should be 32 characters without dashes)
+    local id_length=${#user_id_no_dashes}
+    if [ "$id_length" -ne 32 ]; then
+        log_message "ERROR: Invalid User ID format - expected 32 hexadecimal characters (with or without dashes)"
+        log_message "ERROR: Got $id_length characters after removing dashes"
+        log_message "ERROR: Example formats:"
+        log_message "ERROR:   a1b2c3d4e5f67890a1b2c3d4e5f67890"
+        log_message "ERROR:   a1b2c3d4-e5f6-7890-a1b2-c3d4e5f67890"
+        return 1
+    fi
+
+    # Check if it's a valid hexadecimal string
+    if ! [[ "$user_id_no_dashes" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        log_message "ERROR: Invalid User ID format - must contain only hexadecimal characters (0-9, a-f) and dashes"
+        log_message "ERROR: Your User ID contains invalid characters"
+        log_message "ERROR: Please verify your User ID in Jellyfin Dashboard"
+        return 1
+    fi
+
+    log_message "DEBUG: User ID format validated successfully"
+    return 0
+}
+
 # Function to test API endpoints
 test_api_endpoints() {
     log_message "DEBUG: Testing API connection..."
@@ -700,11 +739,11 @@ validate_environment() {
     fi
     log_message "DEBUG: JELLYFIN_API_KEY format is valid (value hidden)"
 
-    if [ -z "$JELLYFIN_USER_ID" ]; then
-        log_message "ERROR: JELLYFIN_USER_ID is not set"
+    # Validate User ID format before attempting any API calls
+    if ! validate_user_id_format "$JELLYFIN_USER_ID"; then
         return 1
     fi
-    log_message "DEBUG: JELLYFIN_USER_ID is set to: $JELLYFIN_USER_ID"
+    log_message "DEBUG: JELLYFIN_USER_ID format is valid (value hidden for security)"
 
     # Test Jellyfin connection
     log_message "DEBUG: Testing Jellyfin connection..."
