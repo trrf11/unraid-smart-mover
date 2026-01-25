@@ -15,7 +15,7 @@
 # Variables:
 JELLYFIN_URL="http://localhost:8096"  # Change this to your Jellyfin server URL
 JELLYFIN_API_KEY=""                   # Your Jellyfin API key
-JELLYFIN_USER_ID=""                   # Your Jellyfin user ID
+JELLYFIN_USER_IDS=""                  # Jellyfin user ID(s) - space-separated for multiple users
 CACHE_THRESHOLD=90                    # Percentage of cache usage that triggers moving files
 CACHE_DRIVE="/mnt/cache"
 DEBUG=true                            # Set to true to enable debug logging
@@ -482,18 +482,10 @@ validate_api_key_format() {
     return 0
 }
 
-# Function to validate User ID format
+# Function to validate a single User ID format
 # Jellyfin User IDs are UUIDs (with or without dashes)
-validate_user_id_format() {
+validate_single_user_id() {
     local user_id="$1"
-
-    # Check if empty
-    if [ -z "$user_id" ]; then
-        log_message "ERROR: JELLYFIN_USER_ID is empty"
-        log_message "ERROR: Please set your Jellyfin user ID in the script configuration"
-        log_message "ERROR: You can find your user ID in Jellyfin: Dashboard > Users > Click user > URL contains the ID"
-        return 1
-    fi
 
     # Remove dashes for validation
     local user_id_no_dashes="${user_id//-/}"
@@ -501,23 +493,44 @@ validate_user_id_format() {
     # Check length (should be 32 characters without dashes)
     local id_length=${#user_id_no_dashes}
     if [ "$id_length" -ne 32 ]; then
-        log_message "ERROR: Invalid User ID format - expected 32 hexadecimal characters (with or without dashes)"
-        log_message "ERROR: Got $id_length characters after removing dashes"
-        log_message "ERROR: Example formats:"
-        log_message "ERROR:   a1b2c3d4e5f67890a1b2c3d4e5f67890"
-        log_message "ERROR:   a1b2c3d4-e5f6-7890-a1b2-c3d4e5f67890"
+        log_message "ERROR: Invalid User ID format for '$user_id' - expected 32 hexadecimal characters"
         return 1
     fi
 
     # Check if it's a valid hexadecimal string
     if ! [[ "$user_id_no_dashes" =~ ^[0-9a-fA-F]{32}$ ]]; then
-        log_message "ERROR: Invalid User ID format - must contain only hexadecimal characters (0-9, a-f) and dashes"
-        log_message "ERROR: Your User ID contains invalid characters"
-        log_message "ERROR: Please verify your User ID in Jellyfin Dashboard"
+        log_message "ERROR: Invalid User ID format for '$user_id' - must contain only hexadecimal characters"
         return 1
     fi
 
-    log_message "DEBUG: User ID format validated successfully"
+    return 0
+}
+
+# Function to validate User IDs (supports multiple space-separated IDs)
+validate_user_ids_format() {
+    # Check if empty
+    if [ -z "$JELLYFIN_USER_IDS" ]; then
+        log_message "ERROR: JELLYFIN_USER_IDS is empty"
+        log_message "ERROR: Please set your Jellyfin user ID(s) in the script configuration"
+        log_message "ERROR: For multiple users, separate IDs with spaces"
+        log_message "ERROR: You can find user IDs in Jellyfin: Dashboard > Users > Click user > URL contains the ID"
+        return 1
+    fi
+
+    local valid_count=0
+    for user_id in $JELLYFIN_USER_IDS; do
+        if validate_single_user_id "$user_id"; then
+            valid_count=$((valid_count + 1))
+        else
+            return 1
+        fi
+    done
+
+    if [ "$valid_count" -eq 1 ]; then
+        log_message "DEBUG: 1 user ID validated successfully"
+    else
+        log_message "DEBUG: $valid_count user IDs validated successfully"
+    fi
     return 0
 }
 
@@ -656,9 +669,11 @@ make_api_call() {
     return 0
 }
 
-# Function to get played items from Jellyfin
-get_played_items() {
-    log_stderr "DEBUG: Starting get_played_items function at $(date '+%Y-%m-%d %H:%M:%S')"
+# Function to get played items from Jellyfin for a single user
+get_played_items_for_user() {
+    local user_id="$1"
+
+    log_stderr "DEBUG: Fetching played items for user $user_id"
 
     # Create temporary files
     local tmp_response
@@ -668,62 +683,87 @@ get_played_items() {
     local tmp_error
     tmp_error=$(mktemp)
 
-    # Ensure temp files are cleaned up
-    trap 'rm -f "$tmp_response" "$tmp_paths" "$tmp_error"' EXIT
-
     # Get the API response
-    local api_url="$JELLYFIN_URL/Users/$JELLYFIN_USER_ID/Items"
+    local api_url="$JELLYFIN_URL/Users/$user_id/Items"
     local query_params="IsPlayed=true&IncludeItemTypes=Movie,Episode&SortBy=LastPlayedDate&SortOrder=Descending&Recursive=true&Fields=Path"
     local full_url="${api_url}?${query_params}"
 
-    log_stderr "DEBUG: API request details at $(date '+%Y-%m-%d %H:%M:%S'):"
-    log_stderr "DEBUG: Base URL: $JELLYFIN_URL"
-    log_stderr "DEBUG: User ID: $JELLYFIN_USER_ID"
-    log_stderr "DEBUG: Full URL: $full_url"
-
     # Make the API call and save to temp file
-    log_stderr "DEBUG: Making API call to get played items..."
-    if ! make_api_call "$full_url" "GET" "Getting played items" > "$tmp_response"; then
-        log_stderr "ERROR: API call failed at $(date '+%Y-%m-%d %H:%M:%S')"
-        log_stderr "DEBUG: API response saved to: $tmp_response"
-        log_stderr "DEBUG: Response content: $(cat "$tmp_response")"
+    if ! make_api_call "$full_url" "GET" "Getting played items for user $user_id" > "$tmp_response"; then
+        log_stderr "ERROR: API call failed for user $user_id"
+        rm -f "$tmp_response" "$tmp_paths" "$tmp_error"
         return 1
     fi
 
     # Verify we got a response
     if [ ! -s "$tmp_response" ]; then
-        log_stderr "ERROR: Empty response from API at $(date '+%Y-%m-%d %H:%M:%S')"
-        return 1
-    fi
-
-    log_stderr "DEBUG: Successfully received API response at $(date '+%Y-%m-%d %H:%M:%S')"
-    log_stderr "DEBUG: Response file size: $(wc -c < "$tmp_response") bytes"
-    log_stderr "DEBUG: First 500 chars of response: $(head -c 500 "$tmp_response")"
-
-    # Process the response with jq and show the command for debugging
-    local jq_cmd='.Items[] | select(.Path != null) | .Path'
-    log_stderr "DEBUG: Running jq command at $(date '+%Y-%m-%d %H:%M:%S'): $jq_cmd"
-
-    if ! jq -r "$jq_cmd" "$tmp_response" > "$tmp_paths" 2> "$tmp_error"; then
-        log_stderr "ERROR: Failed to parse played items JSON at $(date '+%Y-%m-%d %H:%M:%S')"
-        log_stderr "DEBUG: JQ Error: $(cat "$tmp_error")"
-        log_stderr "DEBUG: Response data: $(cat "$tmp_response")"
-        return 1
-    fi
-
-    # Handle empty results
-    if [ ! -s "$tmp_paths" ]; then
-        log_stderr "DEBUG: No played items found in response at $(date '+%Y-%m-%d %H:%M:%S')"
+        log_stderr "DEBUG: Empty response from API for user $user_id"
+        rm -f "$tmp_response" "$tmp_paths" "$tmp_error"
         return 0
     fi
 
-    # Log number of items found
-    local item_count
-    item_count=$(wc -l < "$tmp_paths")
-    log_stderr "DEBUG: Found $item_count played items at $(date '+%Y-%m-%d %H:%M:%S')"
+    # Process the response with jq
+    local jq_cmd='.Items[] | select(.Path != null) | .Path'
+    if ! jq -r "$jq_cmd" "$tmp_response" > "$tmp_paths" 2> "$tmp_error"; then
+        log_stderr "ERROR: Failed to parse played items JSON for user $user_id"
+        log_stderr "DEBUG: JQ Error: $(cat "$tmp_error")"
+        rm -f "$tmp_response" "$tmp_paths" "$tmp_error"
+        return 1
+    fi
 
-    # Output the paths
-    cat "$tmp_paths"
+    # Output the paths (if any)
+    if [ -s "$tmp_paths" ]; then
+        local count
+        count=$(wc -l < "$tmp_paths")
+        log_stderr "DEBUG: Found $count played items for user $user_id"
+        cat "$tmp_paths"
+    fi
+
+    rm -f "$tmp_response" "$tmp_paths" "$tmp_error"
+    return 0
+}
+
+# Function to get played items from Jellyfin (all configured users)
+get_played_items() {
+    log_stderr "DEBUG: Starting get_played_items function at $(date '+%Y-%m-%d %H:%M:%S')"
+
+    # Create temporary file for combined results
+    local tmp_all_paths
+    tmp_all_paths=$(mktemp)
+
+    # Ensure temp file is cleaned up
+    trap 'rm -f "$tmp_all_paths"' EXIT
+
+    local user_count=0
+    for user_id in $JELLYFIN_USER_IDS; do
+        user_count=$((user_count + 1))
+        get_played_items_for_user "$user_id" >> "$tmp_all_paths"
+    done
+
+    if [ "$user_count" -gt 1 ]; then
+        log_stderr "DEBUG: Queried $user_count users for played items"
+    fi
+
+    # Remove duplicates (same file watched by multiple users)
+    local tmp_unique
+    tmp_unique=$(mktemp)
+    sort -u "$tmp_all_paths" > "$tmp_unique"
+
+    # Handle empty results
+    if [ ! -s "$tmp_unique" ]; then
+        log_stderr "DEBUG: No played items found across all users"
+        rm -f "$tmp_unique"
+        return 0
+    fi
+
+    # Log total unique items
+    local total_count
+    total_count=$(wc -l < "$tmp_unique")
+    log_stderr "DEBUG: Found $total_count unique played items across $user_count user(s)"
+
+    # Output the unique paths
+    cat "$tmp_unique"
+    rm -f "$tmp_unique"
     return 0
 }
 
@@ -977,11 +1017,10 @@ validate_environment() {
     fi
     log_message "DEBUG: JELLYFIN_API_KEY format is valid (value hidden)"
 
-    # Validate User ID format before attempting any API calls
-    if ! validate_user_id_format "$JELLYFIN_USER_ID"; then
+    # Validate User ID(s) format before attempting any API calls
+    if ! validate_user_ids_format; then
         return 1
     fi
-    log_message "DEBUG: JELLYFIN_USER_ID format is valid (value hidden for security)"
 
     # Test Jellyfin connection
     log_message "DEBUG: Testing Jellyfin connection..."
@@ -992,18 +1031,22 @@ validate_environment() {
         return 1
     fi
     log_message "DEBUG: System Info response: $test_response"
-    
-    # Validate user ID exists
-    log_message "DEBUG: Validating user ID..."
-    local user_test
-    user_test=$(make_api_call "$JELLYFIN_URL/Users/$JELLYFIN_USER_ID" "GET" "User Info")
-    if [ $? -ne 0 ]; then
-        log_message "ERROR: Invalid user ID: $JELLYFIN_USER_ID"
-        log_message "DEBUG: User Info response: $user_test"
-        return 1
-    fi
-    log_message "DEBUG: User Info response: $user_test"
-    
+
+    # Validate each user ID exists
+    log_message "DEBUG: Validating user ID(s)..."
+    for user_id in $JELLYFIN_USER_IDS; do
+        local user_test
+        user_test=$(make_api_call "$JELLYFIN_URL/Users/$user_id" "GET" "User Info for $user_id")
+        if [ $? -ne 0 ]; then
+            log_message "ERROR: Invalid user ID: $user_id"
+            return 1
+        fi
+        # Extract username from response for logging
+        local username
+        username=$(echo "$user_test" | jq -r '.Name // "unknown"' 2>/dev/null)
+        log_message "DEBUG: Validated user: $username"
+    done
+
     log_message "DEBUG: Successfully connected to Jellyfin server"
     
     # Log environment settings

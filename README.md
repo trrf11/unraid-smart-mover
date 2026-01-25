@@ -5,6 +5,7 @@ Intelligently moves played media from cache to array based on Jellyfin watch sta
 ## Features
 
 - **Smart Moving** - Only moves media marked as played in Jellyfin
+- **Multi-User Support** - Track played status across multiple Jellyfin users
 - **Cache Threshold** - Triggers only when cache usage exceeds configured percentage
 - **Safe Transfers** - Uses rsync to verify transfers before removing source files
 - **Media-Aware** - Movies move with entire folder (including subtitles), TV episodes move individually with matching subtitles
@@ -34,7 +35,9 @@ Intelligently moves played media from cache to array based on Jellyfin watch sta
 |----------|-------------|---------|
 | `JELLYFIN_URL` | Jellyfin server URL | `http://your-server:8096` |
 | `JELLYFIN_API_KEY` | API key from Jellyfin Dashboard > API Keys | 32-char hex string |
-| `JELLYFIN_USER_ID` | User ID (32-char hex, found in user URL) | 32-char hex string |
+| `JELLYFIN_USER_IDS` | User ID(s) - space-separated for multiple users | `abc123... def456...` |
+
+**Multi-user support:** To track played status across multiple users (e.g., family members), add all user IDs separated by spaces. Files watched by any user will be moved.
 
 ### Cache Settings
 
