@@ -22,10 +22,10 @@ Intelligently moves played media from cache to array based on Jellyfin watch sta
 
 ## Quick Start
 
-1. Copy `jellyfin_smart_mover.sh` to User Scripts
+1. Copy script `jellyfin_smart_mover.sh` to a new script in the User Scripts plugin
 2. Edit the configuration variables at the top of the script
-3. Run with `--dry-run` to test
-4. Schedule as desired
+3. Run with `--dry-run` to test by setting DRY_RUN=true
+4. Schedule as desired using the User Scripts cron
 
 ## Configuration
 
