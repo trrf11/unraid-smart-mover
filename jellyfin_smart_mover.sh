@@ -551,7 +551,7 @@ get_played_items() {
 
     # Get the API response
     local api_url="$JELLYFIN_URL/Users/$JELLYFIN_USER_ID/Items"
-    local query_params="IsPlayed=true&IncludeItemTypes=Movie,Episode&SortBy=LastPlayedDate&SortOrder=Descending&Recursive=true"
+    local query_params="IsPlayed=true&IncludeItemTypes=Movie,Episode&SortBy=LastPlayedDate&SortOrder=Descending&Recursive=true&Fields=Path"
     local full_url="${api_url}?${query_params}"
 
     log_stderr "DEBUG: API request details at $(date '+%Y-%m-%d %H:%M:%S'):"
