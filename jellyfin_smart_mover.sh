@@ -85,9 +85,8 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            echo "Unknown option: $1"
-            echo "Usage: $0 [--dry-run|-n] [--help|-h]"
-            exit 1
+            # Ignore unknown options for compatibility with Unraid User Scripts
+            shift
             ;;
     esac
 done
