@@ -1,80 +1,110 @@
-# Unraid Smart Mover
+# Jellyfin Smart Mover for Unraid
 
-This application integrates with Jellyfin and Unraid's mover to intelligently manage media files between cache and array storage. It moves files from cache to array only after they've been played in Jellyfin and when the cache usage exceeds 90%.
+Intelligently moves played media from cache to array based on Jellyfin watch status. Only moves files you've already watched when cache usage exceeds your threshold.
 
 ## Features
 
-- Monitors cache disk usage
-- Integrates with Jellyfin API to track played media
-- Moves files only when cache reaches 90% capacity
-- Includes logging and retry mechanisms
-- Runs as a scheduled service
+- **Smart Moving** - Only moves media marked as played in Jellyfin
+- **Cache Threshold** - Triggers only when cache usage exceeds configured percentage
+- **Safe Transfers** - Uses rsync to verify transfers before removing source files
+- **Media-Aware** - Movies move with entire folder (including subtitles), TV episodes move individually with matching subtitles
+- **Path Translation** - Handles Docker container path mapping automatically
+- **Cleanup** - Removes empty directories after moving files
+- **Dry-Run Mode** - Preview what would be moved without making changes
+- **Detailed Reporting** - Summary shows movies/episodes with video and subtitle counts
 
-## Setup
+## Requirements
 
-1. Create a `.env` file in the same directory with the following variables:
-```
-JELLYFIN_URL=http://your-jellyfin-server:8096
-JELLYFIN_API_KEY=your-jellyfin-api-key
-CACHE_PATH=/mnt/cache
-ARRAY_PATH=/mnt/disk1
-```
+- Unraid with User Scripts plugin
+- Jellyfin server with API access
+- `jq` (auto-installs or via NerdPack)
 
-## Array Path Selection
+## Quick Start
 
-The `ARRAY_PATH` determines where files are moved when clearing the cache. Choose based on your needs:
+1. Copy `jellyfin_smart_mover.sh` to User Scripts
+2. Edit the configuration variables at the top of the script
+3. Run with `--dry-run` to test
+4. Schedule as desired
 
-### Option 1: Direct Disk Path (Recommended)
-```
-ARRAY_PATH=/mnt/disk1
-```
-- Writes files directly to a specific disk
-- Guarantees files go to that exact disk
-- Use `/mnt/disk2`, `/mnt/disk3`, etc. for other disks
-- **Best for:** Users who want predictable, controlled file placement
+## Configuration
 
-### Option 2: User Share with Cache Bypass (Unraid 6.9+)
-```
-ARRAY_PATH=/mnt/user0
-```
-- Files go to array via user share, bypassing cache
-- Unraid distributes files across disks based on your allocation method
-- Respects split levels and allocation settings
-- **Best for:** Users who want Unraid to manage disk distribution automatically
+### Required Settings
 
-### Option 3: Standard User Share - NOT RECOMMENDED
-```
-ARRAY_PATH=/mnt/user    # WARNING!
-```
-- **Do not use** - this path includes the cache drive
-- Files may be written back to cache, defeating the purpose of moving them
-- Only use if you fully understand the implications
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `JELLYFIN_URL` | Jellyfin server URL | `http://your-server:8096` |
+| `JELLYFIN_API_KEY` | API key from Jellyfin Dashboard > API Keys | 32-char hex string |
+| `JELLYFIN_USER_ID` | User ID (32-char hex, found in user URL) | 32-char hex string |
 
-2. Install the required dependencies:
+### Cache Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CACHE_DRIVE` | `/mnt/cache` | Cache drive path |
+| `CACHE_THRESHOLD` | `90` | Percentage that triggers moving |
+
+### Media Pool Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MOVIES_POOL` | `movies-pool` | Movies share name |
+| `TV_POOL` | `tv-pool` | TV shows share name |
+
+### Path Mapping (Docker)
+
+If Jellyfin runs in Docker with different mount paths:
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `JELLYFIN_PATH_PREFIX` | Path as seen by Jellyfin | `/media/media` |
+| `LOCAL_PATH_PREFIX` | Corresponding Unraid path | `/mnt/cache/media` |
+
+### Array Destination
+
+| Option | Path | Use Case |
+|--------|------|----------|
+| Direct Disk | `/mnt/disk1` | Predictable placement on specific disk |
+| User Share (bypass cache) | `/mnt/user0` | Let Unraid manage distribution |
+| User Share | `/mnt/user` | **Not recommended** - may write back to cache |
+
+## Usage
+
 ```bash
-pip install -r requirements.txt
+# Dry-run (preview only)
+./jellyfin_smart_mover.sh --dry-run
+
+# Live run
+./jellyfin_smart_mover.sh
 ```
 
-3. Make the script executable:
-```bash
-chmod +x smart_mover.py
+### Example Output
+
+```
+=========================================
+Dry-run summary: Processed 150 played items from Jellyfin
+=========================================
+  Movies: 3 would be moved
+    - Video files: 3
+    - Subtitle files: 2
+  TV Episodes: 12 would be moved
+    - Video files: 12
+    - Subtitle files: 8
+  -----------------------------------------
+  Total: 25 files (15 video, 10 subtitles)
+  Skipped: 135 items (not on cache or already on array)
 ```
 
-4. Run the application:
-```bash
-./smart_mover.py
-```
+## How It Works
 
-## Logging
+1. Checks if cache usage exceeds threshold
+2. Queries Jellyfin API for all played movies and episodes
+3. Translates Jellyfin paths to local Unraid paths
+4. For each played item found on cache:
+   - **Movies**: Moves entire folder (video + subtitles + extras)
+   - **TV Episodes**: Moves video file + matching subtitle files (by S##E## pattern)
+5. Uses rsync for safe transfer (verifies before deleting source)
+6. Cleans up empty directories
 
-Logs are stored in `smart_mover.log` with automatic rotation at 10MB and 30-day retention.
+## License
 
-## Operation
-
-The script will:
-1. Check cache disk usage every hour
-2. If usage is above 90%, it will:
-   - Fetch played items from Jellyfin
-   - Identify matching files in cache
-   - Move played files to the array
-3. All operations are logged and include retry mechanisms for reliability
+MIT
