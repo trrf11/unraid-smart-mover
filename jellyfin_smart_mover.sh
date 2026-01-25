@@ -84,6 +84,16 @@ DRY_RUN=false
 # Subtitle file extensions
 SUBTITLE_EXTENSIONS="srt sub ass ssa vtt idx smi"
 
+# Counters for summary statistics (reset in process_played_items)
+STATS_MOVIES_COUNT=0        # Number of movies processed
+STATS_MOVIES_VIDEOS=0       # Video files moved for movies
+STATS_MOVIES_SUBTITLES=0    # Subtitle files moved for movies
+STATS_TV_COUNT=0            # Number of TV episodes processed
+STATS_TV_VIDEOS=0           # Video files moved for TV
+STATS_TV_SUBTITLES=0        # Subtitle files moved for TV
+STATS_SKIPPED=0             # Items skipped (not on cache/already exists)
+STATS_ERRORS=0              # Errors encountered
+
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -207,7 +217,8 @@ extract_episode_pattern() {
 }
 
 # Function to move a single file (used by both movie and TV handlers)
-# Returns 0 on success, 1 on failure
+# Uses rsync for safe cross-filesystem transfers with verification
+# Returns 0 on success, 1 on failure, 2 on skip (already exists)
 move_single_file() {
     local source_path="$1"
     local target_path="$2"
@@ -216,7 +227,7 @@ move_single_file() {
     # Check if target already exists
     if [ -f "$target_path" ]; then
         log_message "DEBUG: Target $file_type already exists: $target_path"
-        return 0
+        return 2  # Skip - already exists
     fi
 
     # Create target directory if needed
@@ -237,7 +248,8 @@ move_single_file() {
             return 1
         fi
 
-        if mv "$source_path" "$target_path"; then
+        # Use rsync for safe transfer: preserves attributes, verifies transfer, only removes source on success
+        if rsync -a --remove-source-files "$source_path" "$target_path"; then
             log_message "Successfully moved $file_type: $source_path"
             return 0
         else
@@ -247,8 +259,40 @@ move_single_file() {
     fi
 }
 
+# Function to clean up empty directories after moving files
+# Walks up from the given path, removing empty directories until it hits the stop path
+cleanup_empty_dirs() {
+    local start_path="$1"
+    local stop_path="$2"  # Don't delete this directory or anything above it
+
+    local current_dir="$start_path"
+
+    while [ "$current_dir" != "$stop_path" ] && [ "$current_dir" != "/" ]; do
+        # Only attempt removal if directory exists and is empty
+        if [ -d "$current_dir" ] && [ -z "$(ls -A "$current_dir" 2>/dev/null)" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                dry_run_log "Would remove empty directory: $current_dir"
+            else
+                if rmdir "$current_dir" 2>/dev/null; then
+                    log_message "DEBUG: Removed empty directory: $current_dir"
+                else
+                    # Directory not empty or permission denied, stop here
+                    break
+                fi
+            fi
+        else
+            # Directory not empty, stop climbing
+            break
+        fi
+
+        # Move up to parent directory
+        current_dir=$(dirname "$current_dir")
+    done
+}
+
 # Function to move associated subtitle files for TV episodes
 # Finds files in the same directory matching the S##E## pattern
+# Updates global STATS_TV_SUBTITLES counter
 move_tv_subtitles() {
     local video_path="$1"
     local video_dir
@@ -295,13 +339,20 @@ move_tv_subtitles() {
             local rel_path="${file#$CACHE_DRIVE/}"
             local target_path="$ARRAY_PATH/$rel_path"
 
-            if move_single_file "$file" "$target_path" "subtitle"; then
+            local move_result
+            move_single_file "$file" "$target_path" "subtitle"
+            move_result=$?
+
+            if [ "$move_result" -eq 0 ]; then
                 subtitle_count=$((subtitle_count + 1))
             fi
         fi
     done
 
     if [ "$subtitle_count" -gt 0 ]; then
+        # Update global stats
+        STATS_TV_SUBTITLES=$((STATS_TV_SUBTITLES + subtitle_count))
+
         if [ "$DRY_RUN" = true ]; then
             log_message "DEBUG: Would move $subtitle_count subtitle file(s) for $episode_pattern"
         else
@@ -313,6 +364,8 @@ move_tv_subtitles() {
 }
 
 # Function to move entire movie folder
+# Returns 0 on success (files moved), 1 on error, 2 if all files already existed
+# Updates global STATS_MOVIES_* counters
 move_movie_folder() {
     local video_path="$1"
     local movie_dir
@@ -321,6 +374,10 @@ move_movie_folder() {
     log_message "DEBUG: Moving entire movie folder: $movie_dir"
 
     local file_count=0
+    local video_count=0
+    local subtitle_count=0
+    local skip_count=0
+    local error_count=0
 
     # Move all files in the movie directory
     for file in "$movie_dir"/*; do
@@ -333,26 +390,62 @@ move_movie_folder() {
         local rel_path="${file#$CACHE_DRIVE/}"
         local target_path="$ARRAY_PATH/$rel_path"
 
-        # Determine file type for logging
+        # Determine file type for logging and counting
         local file_type="file"
+        local is_subtitle=false
         if is_subtitle_file "$filename"; then
             file_type="subtitle"
+            is_subtitle=true
         elif [[ "$file" = "$video_path" ]]; then
             file_type="video"
         fi
 
-        if move_single_file "$file" "$target_path" "$file_type"; then
-            file_count=$((file_count + 1))
-        fi
+        local move_result
+        move_single_file "$file" "$target_path" "$file_type"
+        move_result=$?
+
+        case $move_result in
+            0)
+                file_count=$((file_count + 1))
+                if [ "$is_subtitle" = true ]; then
+                    subtitle_count=$((subtitle_count + 1))
+                else
+                    video_count=$((video_count + 1))
+                fi
+                ;;
+            1) error_count=$((error_count + 1)) ;;
+            2) skip_count=$((skip_count + 1)) ;;
+        esac
     done
 
     if [ "$DRY_RUN" = true ]; then
-        log_message "DEBUG: Would move $file_count file(s) from movie folder"
+        log_message "DEBUG: Would move $file_count file(s) from movie folder ($video_count video, $subtitle_count subtitles)"
     else
-        log_message "DEBUG: Moved $file_count file(s) from movie folder"
+        log_message "DEBUG: Moved $file_count file(s) from movie folder ($video_count video, $subtitle_count subtitles)"
     fi
 
-    return 0
+    # Update global stats if we moved files
+    if [ "$file_count" -gt 0 ]; then
+        STATS_MOVIES_COUNT=$((STATS_MOVIES_COUNT + 1))
+        STATS_MOVIES_VIDEOS=$((STATS_MOVIES_VIDEOS + video_count))
+        STATS_MOVIES_SUBTITLES=$((STATS_MOVIES_SUBTITLES + subtitle_count))
+    fi
+
+    # Clean up empty movie directory after moving files
+    # cleanup_empty_dirs handles dry-run mode internally
+    if [ "$file_count" -gt 0 ] || [ "$DRY_RUN" = true ]; then
+        cleanup_empty_dirs "$movie_dir" "$CACHE_DRIVE"
+    fi
+
+    # Return appropriate status
+    if [ "$error_count" -gt 0 ]; then
+        STATS_ERRORS=$((STATS_ERRORS + error_count))
+        return 1
+    elif [ "$file_count" -gt 0 ]; then
+        return 0
+    else
+        return 2  # All files already existed
+    fi
 }
 
 # Function to validate API key format
@@ -635,13 +728,14 @@ get_played_items() {
 }
 
 # Function to process a single item
+# Returns 0 on success (file moved), 1 on error, 2 on skip (not found, not on cache, already exists)
 process_item() {
     local jellyfin_path="$1"
     local cache_usage="$2"
 
     # Skip empty paths or debug messages
     if [ -z "$jellyfin_path" ] || [[ "$jellyfin_path" == *"DEBUG:"* ]] || [[ "$jellyfin_path" == *"ERROR:"* ]]; then
-        return 0
+        return 2  # Skip
     fi
 
     # Translate Jellyfin path to local Unraid path
@@ -653,14 +747,14 @@ process_item() {
 
     # Check if file exists
     if [ ! -f "$item_path" ]; then
-        log_message "DEBUG: Skipping $item_path - file not found"
-        return 0
+        log_message "DEBUG: Skipping $item_path - file not found (not on cache)"
+        return 2  # Skip - file not on cache
     fi
 
     # Check if file is on cache drive
     if [[ "$item_path" != "$CACHE_DRIVE"* ]]; then
         log_message "DEBUG: Skipping $item_path - not on cache drive"
-        return 0
+        return 2  # Skip - not on cache
     fi
 
     # Detect media type and handle accordingly
@@ -682,23 +776,41 @@ process_item() {
             # Get target path on array for the video
             local rel_path="${item_path#$CACHE_DRIVE/}"
             local array_path="$ARRAY_PATH/$rel_path"
+            local item_dir
+            item_dir=$(dirname "$item_path")
 
             # Check if target already exists
             if [ -f "$array_path" ]; then
                 log_message "DEBUG: Target video already exists: $array_path"
                 # Still check for subtitles that might need moving
                 move_tv_subtitles "$item_path"
-                return 0
+                return 2  # Skip - already exists
             fi
 
             # Move the video file
-            if ! move_single_file "$item_path" "$array_path" "video"; then
-                return 1
+            local move_result
+            move_single_file "$item_path" "$array_path" "video"
+            move_result=$?
+
+            if [ "$move_result" -eq 1 ]; then
+                STATS_ERRORS=$((STATS_ERRORS + 1))
+                return 1  # Error
             fi
 
-            # Move associated subtitle files
+            # Successfully moved video - update stats
+            if [ "$move_result" -eq 0 ]; then
+                STATS_TV_COUNT=$((STATS_TV_COUNT + 1))
+                STATS_TV_VIDEOS=$((STATS_TV_VIDEOS + 1))
+            fi
+
+            # Move associated subtitle files (updates STATS_TV_SUBTITLES internally)
             move_tv_subtitles "$item_path"
-            return 0
+
+            # Clean up empty directories (season folder, show folder)
+            # cleanup_empty_dirs handles dry-run mode internally
+            cleanup_empty_dirs "$item_dir" "$CACHE_DRIVE"
+
+            return $move_result
             ;;
         *)
             # Unknown media type - use legacy behavior (just move the file)
@@ -706,15 +818,25 @@ process_item() {
 
             local rel_path="${item_path#$CACHE_DRIVE/}"
             local array_path="$ARRAY_PATH/$rel_path"
+            local item_dir
+            item_dir=$(dirname "$item_path")
 
             # Check if target already exists
             if [ -f "$array_path" ]; then
                 log_message "DEBUG: Target file already exists: $array_path"
-                return 0
+                return 2  # Skip - already exists
             fi
 
+            local move_result
             move_single_file "$item_path" "$array_path" "video"
-            return $?
+            move_result=$?
+
+            # Clean up empty directories (cleanup_empty_dirs handles dry-run internally)
+            if [ "$move_result" -eq 0 ]; then
+                cleanup_empty_dirs "$item_dir" "$CACHE_DRIVE"
+            fi
+
+            return $move_result
             ;;
     esac
 }
@@ -723,18 +845,27 @@ process_item() {
 process_played_items() {
     local cache_usage=$1
     local count=0
-    local moved=0
-    local errors=0
-    
+    local skipped=0
+
+    # Reset global statistics counters
+    STATS_MOVIES_COUNT=0
+    STATS_MOVIES_VIDEOS=0
+    STATS_MOVIES_SUBTITLES=0
+    STATS_TV_COUNT=0
+    STATS_TV_VIDEOS=0
+    STATS_TV_SUBTITLES=0
+    STATS_SKIPPED=0
+    STATS_ERRORS=0
+
     log_message "DEBUG: Processing played items with cache usage at $cache_usage%"
-    
+
     # Create temporary file for played items
     local tmp_items
     tmp_items=$(mktemp)
-    
+
     # Ensure temp file is cleaned up
     trap 'rm -f "$tmp_items"' EXIT
-    
+
     # Get list of played items and save to temp file
     if ! get_played_items > "$tmp_items"; then
         log_message "ERROR: Failed to get played items list"
@@ -753,21 +884,75 @@ process_played_items() {
         if [ -z "$path" ] || [[ "$path" == *"DEBUG:"* ]] || [[ "$path" == *"ERROR:"* ]]; then
             continue
         fi
-        
+
         count=$((count + 1))
         log_message "DEBUG: Processing item $count: $path"
-        
-        if process_item "$path" "$cache_usage"; then
-            moved=$((moved + 1))
-        else
-            errors=$((errors + 1))
+
+        local result
+        process_item "$path" "$cache_usage"
+        result=$?
+
+        # Track skipped items (return code 2)
+        if [ "$result" -eq 2 ]; then
+            skipped=$((skipped + 1))
         fi
     done < "$tmp_items"
 
+    # Calculate totals
+    local total_moved=$((STATS_MOVIES_COUNT + STATS_TV_COUNT))
+    local total_videos=$((STATS_MOVIES_VIDEOS + STATS_TV_VIDEOS))
+    local total_subtitles=$((STATS_MOVIES_SUBTITLES + STATS_TV_SUBTITLES))
+    local total_files=$((total_videos + total_subtitles))
+
+    # Display summary
     if [ "$DRY_RUN" = true ]; then
-        log_message "Dry-run summary: Processed $count items, would move $moved files"
+        log_message "========================================="
+        log_message "Dry-run summary: Processed $count played items from Jellyfin"
+        log_message "========================================="
+        if [ "$STATS_MOVIES_COUNT" -gt 0 ]; then
+            log_message "  Movies: $STATS_MOVIES_COUNT would be moved"
+            log_message "    - Video files: $STATS_MOVIES_VIDEOS"
+            log_message "    - Subtitle files: $STATS_MOVIES_SUBTITLES"
+        fi
+        if [ "$STATS_TV_COUNT" -gt 0 ]; then
+            log_message "  TV Episodes: $STATS_TV_COUNT would be moved"
+            log_message "    - Video files: $STATS_TV_VIDEOS"
+            log_message "    - Subtitle files: $STATS_TV_SUBTITLES"
+        fi
+        if [ "$total_moved" -gt 0 ]; then
+            log_message "  -----------------------------------------"
+            log_message "  Total: $total_files files ($total_videos video, $total_subtitles subtitles)"
+        else
+            log_message "  No files to move (all on array or not found)"
+        fi
+        log_message "  Skipped: $skipped items (not on cache or already on array)"
+        if [ "$STATS_ERRORS" -gt 0 ]; then
+            log_message "  Errors: $STATS_ERRORS"
+        fi
     else
-        log_message "Summary: Processed $count items, moved $moved files, encountered $errors errors"
+        log_message "========================================="
+        log_message "Summary: Processed $count played items from Jellyfin"
+        log_message "========================================="
+        if [ "$STATS_MOVIES_COUNT" -gt 0 ]; then
+            log_message "  Movies: $STATS_MOVIES_COUNT moved"
+            log_message "    - Video files: $STATS_MOVIES_VIDEOS"
+            log_message "    - Subtitle files: $STATS_MOVIES_SUBTITLES"
+        fi
+        if [ "$STATS_TV_COUNT" -gt 0 ]; then
+            log_message "  TV Episodes: $STATS_TV_COUNT moved"
+            log_message "    - Video files: $STATS_TV_VIDEOS"
+            log_message "    - Subtitle files: $STATS_TV_SUBTITLES"
+        fi
+        if [ "$total_moved" -gt 0 ]; then
+            log_message "  -----------------------------------------"
+            log_message "  Total: $total_files files ($total_videos video, $total_subtitles subtitles)"
+        else
+            log_message "  No files moved (all on array or not found)"
+        fi
+        log_message "  Skipped: $skipped items (not on cache or already on array)"
+        if [ "$STATS_ERRORS" -gt 0 ]; then
+            log_message "  Errors: $STATS_ERRORS"
+        fi
     fi
     return 0
 }
