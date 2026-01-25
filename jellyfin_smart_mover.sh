@@ -99,6 +99,15 @@ log_message() {
     echo "$message" | tee -a "$LOG_FILE"
 }
 
+# Function to log to stderr (for use inside functions with redirected stdout)
+log_stderr() {
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local message="[$timestamp] $1"
+    echo "$message" >> "$LOG_FILE"
+    echo "$message" >&2
+}
+
 # Initialize log file
 initialize_logging() {
     # Create log file if it doesn't exist
@@ -476,10 +485,10 @@ make_api_call() {
     local url="$1"
     local method="$2"
     local description="$3"
-    
-    log_message "DEBUG: Making $method request to: $url at $(date '+%Y-%m-%d %H:%M:%S')"
-    log_message "DEBUG: Request headers: X-MediaBrowser-Token: [hidden], Accept: application/json"
-    
+
+    log_stderr "DEBUG: Making $method request to: $url at $(date '+%Y-%m-%d %H:%M:%S')"
+    log_stderr "DEBUG: Request headers: X-MediaBrowser-Token: [hidden], Accept: application/json"
+
     # Create temporary files
     local tmp_response
     tmp_response=$(mktemp)
@@ -487,48 +496,48 @@ make_api_call() {
     tmp_final=$(mktemp)
     local tmp_headers
     tmp_headers=$(mktemp)
-    
+
     # Ensure temp files are cleaned up
     trap 'rm -f "$tmp_response" "$tmp_final" "$tmp_headers"' EXIT
-    
+
     # Make the curl call with verbose output for debugging
     if ! curl -v -s -w "\n%{http_code}" \
         -X "$method" \
         -H "X-MediaBrowser-Token: $JELLYFIN_API_KEY" \
         -H "Accept: application/json" \
         "$url" 2>"$tmp_headers" > "$tmp_response"; then
-        log_message "ERROR: Curl command failed for $description"
-        log_message "DEBUG: Curl headers: $(cat "$tmp_headers")"
+        log_stderr "ERROR: Curl command failed for $description"
+        log_stderr "DEBUG: Curl headers: $(cat "$tmp_headers")"
         return 1
     fi
-    
+
     # Extract status code from last line and remove it from response
     local status_code
     status_code=$(tail -n1 "$tmp_response")
     head -n -1 "$tmp_response" > "$tmp_final"
-    
-    log_message "DEBUG: API response code for $description: $status_code"
-    log_message "DEBUG: Curl headers: $(cat "$tmp_headers")"
-    
+
+    log_stderr "DEBUG: API response code for $description: $status_code"
+    log_stderr "DEBUG: Curl headers: $(cat "$tmp_headers")"
+
     # Log response body for debugging (truncated if too long)
     local response_preview
     response_preview=$(head -c 500 "$tmp_final")
-    log_message "DEBUG: First 500 chars of response: $response_preview"
-    
+    log_stderr "DEBUG: First 500 chars of response: $response_preview"
+
     if [ "$status_code" != "200" ]; then
-        log_message "ERROR: API call failed for $description. Status code: $status_code"
-        log_message "DEBUG: Full response body: $(cat "$tmp_final")"
+        log_stderr "ERROR: API call failed for $description. Status code: $status_code"
+        log_stderr "DEBUG: Full response body: $(cat "$tmp_final")"
         return 1
     fi
-    
+
     cat "$tmp_final"
     return 0
 }
 
 # Function to get played items from Jellyfin
 get_played_items() {
-    log_message "DEBUG: Starting get_played_items function at $(date '+%Y-%m-%d %H:%M:%S')"
-    
+    log_stderr "DEBUG: Starting get_played_items function at $(date '+%Y-%m-%d %H:%M:%S')"
+
     # Create temporary files
     local tmp_response
     tmp_response=$(mktemp)
@@ -536,60 +545,60 @@ get_played_items() {
     tmp_paths=$(mktemp)
     local tmp_error
     tmp_error=$(mktemp)
-    
+
     # Ensure temp files are cleaned up
     trap 'rm -f "$tmp_response" "$tmp_paths" "$tmp_error"' EXIT
-    
+
     # Get the API response
     local api_url="$JELLYFIN_URL/Users/$JELLYFIN_USER_ID/Items"
     local query_params="IsPlayed=true&IncludeItemTypes=Movie,Episode&SortBy=LastPlayedDate&SortOrder=Descending&Recursive=true"
     local full_url="${api_url}?${query_params}"
-    
-    log_message "DEBUG: API request details at $(date '+%Y-%m-%d %H:%M:%S'):"
-    log_message "DEBUG: Base URL: $JELLYFIN_URL"
-    log_message "DEBUG: User ID: $JELLYFIN_USER_ID"
-    log_message "DEBUG: Full URL: $full_url"
-    
+
+    log_stderr "DEBUG: API request details at $(date '+%Y-%m-%d %H:%M:%S'):"
+    log_stderr "DEBUG: Base URL: $JELLYFIN_URL"
+    log_stderr "DEBUG: User ID: $JELLYFIN_USER_ID"
+    log_stderr "DEBUG: Full URL: $full_url"
+
     # Make the API call and save to temp file
-    log_message "DEBUG: Making API call to get played items..."
+    log_stderr "DEBUG: Making API call to get played items..."
     if ! make_api_call "$full_url" "GET" "Getting played items" > "$tmp_response"; then
-        log_message "ERROR: API call failed at $(date '+%Y-%m-%d %H:%M:%S')"
-        log_message "DEBUG: API response saved to: $tmp_response"
-        log_message "DEBUG: Response content: $(cat "$tmp_response")"
+        log_stderr "ERROR: API call failed at $(date '+%Y-%m-%d %H:%M:%S')"
+        log_stderr "DEBUG: API response saved to: $tmp_response"
+        log_stderr "DEBUG: Response content: $(cat "$tmp_response")"
         return 1
     fi
 
     # Verify we got a response
     if [ ! -s "$tmp_response" ]; then
-        log_message "ERROR: Empty response from API at $(date '+%Y-%m-%d %H:%M:%S')"
+        log_stderr "ERROR: Empty response from API at $(date '+%Y-%m-%d %H:%M:%S')"
         return 1
     fi
 
-    log_message "DEBUG: Successfully received API response at $(date '+%Y-%m-%d %H:%M:%S')"
-    log_message "DEBUG: Response file size: $(wc -c < "$tmp_response") bytes"
-    log_message "DEBUG: First 500 chars of response: $(head -c 500 "$tmp_response")"
+    log_stderr "DEBUG: Successfully received API response at $(date '+%Y-%m-%d %H:%M:%S')"
+    log_stderr "DEBUG: Response file size: $(wc -c < "$tmp_response") bytes"
+    log_stderr "DEBUG: First 500 chars of response: $(head -c 500 "$tmp_response")"
 
     # Process the response with jq and show the command for debugging
     local jq_cmd='.Items[] | select(.Path != null) | .Path'
-    log_message "DEBUG: Running jq command at $(date '+%Y-%m-%d %H:%M:%S'): $jq_cmd"
-    
+    log_stderr "DEBUG: Running jq command at $(date '+%Y-%m-%d %H:%M:%S'): $jq_cmd"
+
     if ! jq -r "$jq_cmd" "$tmp_response" > "$tmp_paths" 2> "$tmp_error"; then
-        log_message "ERROR: Failed to parse played items JSON at $(date '+%Y-%m-%d %H:%M:%S')"
-        log_message "DEBUG: JQ Error: $(cat "$tmp_error")"
-        log_message "DEBUG: Response data: $(cat "$tmp_response")"
+        log_stderr "ERROR: Failed to parse played items JSON at $(date '+%Y-%m-%d %H:%M:%S')"
+        log_stderr "DEBUG: JQ Error: $(cat "$tmp_error")"
+        log_stderr "DEBUG: Response data: $(cat "$tmp_response")"
         return 1
     fi
 
     # Handle empty results
     if [ ! -s "$tmp_paths" ]; then
-        log_message "DEBUG: No played items found in response at $(date '+%Y-%m-%d %H:%M:%S')"
+        log_stderr "DEBUG: No played items found in response at $(date '+%Y-%m-%d %H:%M:%S')"
         return 0
     fi
 
     # Log number of items found
     local item_count
     item_count=$(wc -l < "$tmp_paths")
-    log_message "DEBUG: Found $item_count played items at $(date '+%Y-%m-%d %H:%M:%S')"
+    log_stderr "DEBUG: Found $item_count played items at $(date '+%Y-%m-%d %H:%M:%S')"
 
     # Output the paths
     cat "$tmp_paths"
