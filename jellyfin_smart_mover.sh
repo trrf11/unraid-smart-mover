@@ -32,6 +32,21 @@ MOVIES_POOL="movies-pool"             # Your movies share name (e.g., "movies", 
 TV_POOL="tv-pool"                     # Your TV shows share name (e.g., "tv", "shows", "tv-pool")
 
 #########################################
+##       Path Mapping Configuration    ##
+#########################################
+#
+# Jellyfin often runs in a container with different mount paths than the host.
+# Configure these to translate Jellyfin paths to local Unraid paths.
+#
+# Example: If Jellyfin sees files at /media/media/movies-pool/...
+#          but Unraid has them at /mnt/cache/media/movies-pool/...
+#          Set: JELLYFIN_PATH_PREFIX="/media/media"
+#               LOCAL_PATH_PREFIX="/mnt/cache/media"
+#
+JELLYFIN_PATH_PREFIX="/media/media"   # Path prefix as seen by Jellyfin
+LOCAL_PATH_PREFIX="/mnt/cache/media"  # Corresponding path on Unraid
+
+#########################################
 ##       ARRAY_PATH Configuration      ##
 #########################################
 #
@@ -162,6 +177,20 @@ get_media_type() {
         echo "tv"
     else
         echo "unknown"
+    fi
+}
+
+# Function to translate Jellyfin paths to local Unraid paths
+# Jellyfin containers often mount media at different paths than the host
+translate_jellyfin_path() {
+    local jellyfin_path="$1"
+
+    # Replace Jellyfin path prefix with local path prefix
+    if [[ "$jellyfin_path" == "$JELLYFIN_PATH_PREFIX"* ]]; then
+        echo "${jellyfin_path/$JELLYFIN_PATH_PREFIX/$LOCAL_PATH_PREFIX}"
+    else
+        # Path doesn't match expected prefix, return as-is
+        echo "$jellyfin_path"
     fi
 }
 
@@ -607,15 +636,20 @@ get_played_items() {
 
 # Function to process a single item
 process_item() {
-    local item_path="$1"
+    local jellyfin_path="$1"
     local cache_usage="$2"
 
     # Skip empty paths or debug messages
-    if [ -z "$item_path" ] || [[ "$item_path" == *"DEBUG:"* ]] || [[ "$item_path" == *"ERROR:"* ]]; then
+    if [ -z "$jellyfin_path" ] || [[ "$jellyfin_path" == *"DEBUG:"* ]] || [[ "$jellyfin_path" == *"ERROR:"* ]]; then
         return 0
     fi
 
-    log_message "DEBUG: Processing item: $item_path"
+    # Translate Jellyfin path to local Unraid path
+    local item_path
+    item_path=$(translate_jellyfin_path "$jellyfin_path")
+
+    log_message "DEBUG: Processing item: $jellyfin_path"
+    log_message "DEBUG: Translated path: $item_path"
 
     # Check if file exists
     if [ ! -f "$item_path" ]; then
